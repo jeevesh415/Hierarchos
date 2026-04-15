@@ -17,8 +17,8 @@ from hierarchos import HierarchosCore, AttrDict
 
 def create_test_config(compile=False):
     """Create a small test configuration for rapid testing."""
-    return {
-        'vocab_size': 500,
+    return AttrDict({
+        'vocab_size': 50000,
         'context_dim': 32,
         'persistent_dim': 8,
         'ltm_slots': 64,
@@ -28,16 +28,18 @@ def create_test_config(compile=False):
         'ltm_topk': 2,
         'h_hidden': 32,
        'l_hidden': 32,
-        'max_h_steps': 2,
-        'max_l_steps': 2,
-        'l_conv_atol': 1e-4,
-        'h_stride': 2,
-        'commitment_threshold': 0.05,
+        'max_h_steps': 5,
+        'max_l_steps': 10,
+        'l_conv_atol': 2e-4,
+        'h_stride': 1.5,
+        'commitment_threshold': 0.055,
         'compile': compile,
         'gradient_checkpointing': False,
         'max_length': 128,
-        'detach_every_n_steps': 16  # Test truncated BPTT
-    }
+        'detach_every_n_steps': 16,  # Test truncated BPTT
+        'use_deepembed': True,       # V8 DeepEmbed
+        'use_rosa': True,            # V8 ROSA
+    })
 
 def test_gradient_flow_end_to_end():
     """Test 1: Verify gradients flow from output back through all components."""

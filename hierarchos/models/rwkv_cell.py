@@ -34,10 +34,12 @@ class RWKVCell(nn.Module):
         self.receptance_cm = nn.Linear(n_embd, n_embd, bias=False)
         self.value_cm = nn.Linear(n_embd * 4, n_embd, bias=False)
 
-    def forward(self, x, state, timestep=None):
+    def forward(self, x, state, timestep=None, deepemb_vec=None):
         # Handle torch.compile artifacts
         if x.dim() == 3 and x.shape[0] == 1: x = x.squeeze(0)
         if state.dim() == 4 and state.shape[0] == 1: state = state.squeeze(0)
+        if deepemb_vec is not None and deepemb_vec.dim() == 3 and deepemb_vec.shape[0] == 1:
+            deepemb_vec = deepemb_vec.squeeze(0)
 
         # Truncated BPTT logic
         detach_every_n_steps = getattr(self, 'detach_every_n_steps', None)
@@ -105,7 +107,12 @@ class RWKVCell(nn.Module):
         xr = x_norm2 * tm_r_cm + sx_cm * (1 - tm_r_cm)
         
         r = torch.sigmoid(self.receptance_cm(xr))
-        k = torch.square(torch.relu(self.key_cm(xk)))
+        key_out = self.key_cm(xk)
+        k = F.silu(key_out) * torch.relu(key_out)
+        
+        if deepemb_vec is not None:
+            k = k * deepemb_vec
+            
         x = x_resid_cm + r * self.value_cm(k)
 
         new_state = torch.stack([x_in, aa, bb, pp, x_norm2], dim=-1)

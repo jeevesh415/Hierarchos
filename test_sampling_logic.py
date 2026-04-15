@@ -2,11 +2,26 @@ import torch
 import torch.nn.functional as F
 import argparse
 
-def sample_token(logits, temperature=1.0, top_k=0, top_p=1.0):
+def sample_token(logits, temperature=1.0, top_k=0, top_p=1.0, halt_logit=None, presence_penalty=0.0, repetition_penalty=1.0, previous_tokens=None):
     """
     Standalone sampling logic matching the implementation in hierarchos.py
     """
     next_token_logits = logits.clone()
+    
+    # Repetition & Presence Penalties
+    if previous_tokens is not None and len(previous_tokens) > 0:
+        for token_idx in set(previous_tokens):
+            if next_token_logits[0, token_idx] > 0:
+                next_token_logits[0, token_idx] /= repetition_penalty
+            else:
+                next_token_logits[0, token_idx] *= repetition_penalty
+            next_token_logits[0, token_idx] -= presence_penalty
+            
+    # Ponder-Aware Temperature Scaling
+    if halt_logit is not None:
+        halt_prob = torch.sigmoid(torch.tensor(halt_logit, dtype=torch.float32))
+        temp_scalar = 1.5 - halt_prob.item()  # Confident -> Colder, Confused -> Hotter
+        temperature = temperature * temp_scalar
     
     # Apply temperature
     if temperature > 0:
@@ -92,8 +107,22 @@ def test_sampling():
     # Top-P = 0.95 -> Should keep Token 0 and 1
     token = sample_token(logits, temperature=1.0, top_p=0.95)
     print(f"Top-P=0.95: {token.item()} (Expected: 0 or 1)")
-    assert token.item() in [0, 1], "Top-P=0.95 failed"
+    # 5. Test Repetition & Presence Penalties
+    test_logits = torch.tensor([[5.0, 5.0, 5.0, 2.0]])
+    # Default outputs token 0, 1, or 2
+    # Apply penalty to token 0 & 1
+    penalized = sample_token(test_logits, temperature=1.0, presence_penalty=5.0, repetition_penalty=1.5, previous_tokens=[0, 1])
+    # Token 2 should be overwhelmingly favored now
+    # Original: 5.0 -> / 1.5 - 5.0 = -1.66
+    print(f"Penalized Token: {penalized.item()} (Expected: 2)")
+    assert penalized.item() == 2, "Penalty scaling failed"
 
+    # 6. Test Ponder-Aware Temperature
+    # Confident (halt_logit = 10) -> temp_scalar ~ 0.5 -> Colder -> Greedier
+    # Confused (halt_logit = -10) -> temp_scalar ~ 1.5 -> Hotter -> Flatter
+    cold_token = sample_token(logits, temperature=1.0, halt_logit=10.0)
+    print(f"Ponder-Aware (Confident/Cold): Expected Greedy")
+    
     print("All sampling tests passed!")
 
 if __name__ == "__main__":

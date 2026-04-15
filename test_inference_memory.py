@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from hierarchos import HierarchosCore, QuantizedHierarchos, LTMModule
+from hierarchos import HierarchosCore, QuantizedHierarchos, LTMModule, AttrDict
 
 def test_inference_memory_update():
     print("\n=== Test: Inference Memory Update ===")
@@ -25,7 +25,7 @@ def test_inference_memory_update():
         'max_length': 64
     }
     
-    model = HierarchosCore(config)
+    model = HierarchosCore(AttrDict(config))
     model.eval() # Set to eval mode (inference)
     
     # Create dummy input

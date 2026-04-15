@@ -95,9 +95,10 @@ def main():
     train_group.add_argument("--no-persist-state", dest="persist_state", action="store_false", help="Disable state persistence between chunks.")
     train_group.add_argument("--training-chunk-size", "--training_chunk_size", type=int, default=128, help="TBPTT chunk size (Default: 128).")
     train_group.add_argument("--save-steps", type=int, default=0, help="Save a checkpoint every N steps (0 to disable).")
-    train_group.add_argument("--num_workers", type=int, default=0)
-    train_group.add_argument("--amp", action="store_true")
-    parser.add_argument("--compile", action="store_true")
+    train_group.add_argument("--num_workers", type=int, default=0, help="DataLoader workers. Set to 4-8 for GPU training.")
+    train_group.add_argument("--amp", action="store_true", help="Enable mixed precision (auto-enabled on CUDA).")
+    train_group.add_argument("--no-amp", dest="amp", action="store_false", help="Explicitly disable mixed precision.")
+    parser.add_argument("--compile", action="store_true", help="Enable torch.compile (auto-enabled on CUDA).")
     parser.add_argument("--force-compile", action="store_true")
 
     # --- Evaluation Arguments (lm-evaluation-harness) ---

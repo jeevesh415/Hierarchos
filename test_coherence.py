@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 import random
-from hierarchos import HierarchosCore, LTMModule
+from hierarchos import HierarchosCore, LTMModule, AttrDict
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -33,7 +33,7 @@ def test_deterministic_memory():
         'max_length': 64
     }
     
-    model = HierarchosCore(config)
+    model = HierarchosCore(AttrDict(config))
     model.eval()
     
     # Create dummy data

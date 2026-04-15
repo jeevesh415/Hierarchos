@@ -13,7 +13,7 @@ from torch.utils.checkpoint import checkpoint
 from .rwkv_cell import RWKVCell
 from .ltm import LTMModule
 from ..utils.device import setup_msvc_environment, is_directml_device
-
+from ..utils.rosa import ROSA
 
 class WorkerLoop:
     """
@@ -32,7 +32,7 @@ class WorkerLoop:
         self.commitment_threshold = getattr(config, 'commitment_threshold', 0.1)
 
     def __call__(self, enc: torch.Tensor, static_context: torch.Tensor, l_state: torch.Tensor, 
-                initial_drift: torch.Tensor, timestep: Optional[int] = None):
+                initial_drift: torch.Tensor, timestep: Optional[int] = None, l_deepemb_vec: Optional[torch.Tensor] = None):
         # Handle batch dimension squeezing for torch.compile compatibility
         if enc.dim() == 3 and enc.shape[0] == 1: enc = enc.squeeze(0)
         if static_context.dim() == 3 and static_context.shape[0] == 1: static_context = static_context.squeeze(0)
@@ -58,7 +58,7 @@ class WorkerLoop:
         if not self.l_rnn.training:
             prev_shadow = shadow_l_state.clone()
             for step_idx in range(self.max_l_steps):
-                l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, timestep=-(step_idx+1))
+                l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, timestep=-(step_idx+1), deepemb_vec=l_deepemb_vec)
                 shadow_l_state = torch.clamp(shadow_l_state, min=-50.0, max=50.0)
                 
                 drift_delta = torch.tanh(self.context_drift_proj(l_out))
@@ -73,7 +73,7 @@ class WorkerLoop:
                 prev_shadow = shadow_l_state.clone()
         else:
             for step_idx in range(self.max_l_steps):
-                l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, timestep=-(step_idx+1))
+                l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, timestep=-(step_idx+1), deepemb_vec=l_deepemb_vec)
                 shadow_l_state = torch.clamp(shadow_l_state, min=-50.0, max=50.0)
                 
                 drift_delta = torch.tanh(self.context_drift_proj(l_out))
@@ -97,7 +97,7 @@ class WorkerLoop:
         l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
         l_input = self.l_input_proj(l_input_vec)
         
-        final_l_out, next_l_state = self.l_rnn(l_input, l_state, timestep=ts)
+        final_l_out, next_l_state = self.l_rnn(l_input, l_state, timestep=ts, deepemb_vec=l_deepemb_vec)
         next_l_state = torch.clamp(next_l_state, min=-50.0, max=50.0)
         
         final_enc = current_enc + self.l_to_out(final_l_out)
@@ -126,6 +126,17 @@ class HierarchosCore(nn.Module):
             torch.set_flush_denormal(True)
             
         self.tok_emb = nn.Embedding(config.vocab_size, config.context_dim)
+        
+        # V8 DeepEmbed (4x scale) - default to True
+        self.use_deepembed = getattr(config, 'use_deepembed', True)
+        if self.use_deepembed:
+            self.h_deepemb = nn.Embedding(config.vocab_size, config.h_hidden * 4)
+            self.l_deepemb = nn.Embedding(config.vocab_size, config.l_hidden * 4)
+        
+        # V8 ROSA Embed - default to True
+        self.use_rosa = getattr(config, 'use_rosa', True)
+        if self.use_rosa:
+            self.rosa_emb = nn.Embedding(config.vocab_size + 1, config.context_dim)
         
         # Global Learnable State
         self.persistent_dim = getattr(config, 'persistent_dim', 128)
@@ -245,6 +256,42 @@ class HierarchosCore(nn.Module):
 
         x = self.tok_emb(input_ids)
 
+        # Unpack LTM Memory State early so we can use past_tokens
+        if ltm_memory_state is None:
+            curr_fast_vals = self.ltm.fast_vals
+            curr_mom_vals = self.ltm._mom_vals
+            past_tokens = None
+        else:
+            if len(ltm_memory_state) >= 3:
+                curr_fast_vals, curr_mom_vals, past_tokens = ltm_memory_state[:3]
+            else:
+                curr_fast_vals, curr_mom_vals = ltm_memory_state
+                past_tokens = None
+
+        # V8 ROSA Precomputation (only when enabled)
+        if self.use_rosa:
+            if past_tokens is not None:
+                full_input_ids = torch.cat([past_tokens, input_ids], dim=1)
+            else:
+                full_input_ids = input_ids
+                
+            input_ids_cpu = full_input_ids.cpu().tolist()
+            rosa_batch = []
+            for b in range(B):
+                y = ROSA(input_ids_cpu[b])
+                # Only take the ROSA outputs for the CURRENT input sequence
+                y_current = y[-T:]
+                y_current = [val if val != -1 else self.config.vocab_size for val in y_current]
+                rosa_batch.append(torch.tensor(y_current, device=device))
+            
+            rosa_batch_tensor = torch.stack(rosa_batch, dim=0)
+            rosa_embs = self.rosa_emb(rosa_batch_tensor)
+            x = x + rosa_embs  # Neurosymbolic Inner Monologue Mix
+            new_past_tokens = full_input_ids
+        else:
+            new_past_tokens = None
+
+
         # ==================================================================
         # 1. STATE INITIALIZATION (With Context Recovery)
         # ==================================================================
@@ -270,11 +317,8 @@ class HierarchosCore(nn.Module):
         else:
             l_state = l_state.to(device)
 
-        if ltm_memory_state is None:
-            curr_fast_vals = self.ltm.fast_vals
-            curr_mom_vals = self.ltm._mom_vals
-        else:
-            curr_fast_vals, curr_mom_vals = ltm_memory_state
+        # (ltm_memory_state already unpacked above)
+        if ltm_memory_state is not None:
             # Ensure they are on the correct device
             curr_fast_vals = curr_fast_vals.to(device)
             curr_mom_vals = curr_mom_vals.to(device)
@@ -292,8 +336,12 @@ class HierarchosCore(nn.Module):
         # 2. MAIN TIME LOOP
         # ==================================================================
         for t in range(T):
+            token_x_idx = input_ids[:, t]
             token_x = x[:, t]
             abs_t = global_pos_offset + t
+            
+            h_deepemb_vec = self.h_deepemb(token_x_idx) if self.use_deepembed else None
+            l_deepemb_vec = self.l_deepemb(token_x_idx) if self.use_deepembed else None
             
             # --- LTM Retrieval ---
             p = self.persistent.unsqueeze(0).expand(B, -1)
@@ -328,7 +376,7 @@ class HierarchosCore(nn.Module):
             l_feedback = self.l_feedback_proj(l_state[:, :, 0].to(device))
             enc_with_feedback = enc + l_feedback
             
-            h_out_real, h_state = self.h_rnn(enc_with_feedback, h_state, timestep=t)
+            h_out_real, h_state = self.h_rnn(enc_with_feedback, h_state, timestep=t, deepemb_vec=h_deepemb_vec)
             h_out_real = torch.clamp(h_out_real, min=-100.0, max=100.0)
             
             if torch.isnan(h_out_real).any() or torch.isinf(h_out_real).any():
@@ -351,7 +399,7 @@ class HierarchosCore(nn.Module):
                 for step_idx in range(self.config.max_h_steps - 1):
                     if not self.training and h_halt_probs[-1].mean() > getattr(self.config, 'h_halt_thresh', 0.9): 
                         break
-                    h_out_ponder, shadow_h_state = self.h_rnn(current_enc_h, shadow_h_state, timestep=-(step_idx+1))
+                    h_out_ponder, shadow_h_state = self.h_rnn(current_enc_h, shadow_h_state, timestep=-(step_idx+1), deepemb_vec=h_deepemb_vec)
                     halt_logit = self.h_halt_proj(h_out_ponder).squeeze(-1)
                     h_step_outputs.append(h_out_ponder)
                     h_halt_probs.append(torch.sigmoid(halt_logit))
@@ -396,12 +444,12 @@ class HierarchosCore(nn.Module):
 
             if getattr(self.config, 'gradient_checkpointing', False) and self.training:
                 enc, l_state, cc, final_drift = checkpoint(
-                    self.worker_loop_module, enc, sliding_context, l_state, initial_drift, None, 
+                    self.worker_loop_module, enc, sliding_context, l_state, initial_drift, None, l_deepemb_vec,
                     use_reentrant=False
                 )
             else:
                 enc, l_state, cc, final_drift = self.worker_loop_module(
-                    enc, sliding_context, l_state, initial_drift, timestep=None
+                    enc, sliding_context, l_state, initial_drift, timestep=None, l_deepemb_vec=l_deepemb_vec
                 )
             
             final_embs.append(enc)
@@ -462,15 +510,28 @@ class HierarchosCore(nn.Module):
             if not valid_mask.any():
                 loss = torch.tensor(0.0, device=device, requires_grad=True)
             else:
-                loss = F.cross_entropy(
-                    shift_logits.view(-1, self.config.vocab_size).float(), 
-                    shift_labels.view(-1)
-                )
+                flat_logits = shift_logits.view(-1, self.config.vocab_size).float()
+                flat_labels = shift_labels.view(-1)
+                
+                # Base CE Loss computes natively ignoring -100
+                loss = F.cross_entropy(flat_logits, flat_labels)
+                
+                # Z-Loss Regularization built to prevent exploding logits
+                z_loss_weight = getattr(self.config, 'z_loss_weight', 1e-4)
+                if z_loss_weight > 0:
+                    valid_mask_flat = flat_labels != -100
+                    valid_logits = flat_logits[valid_mask_flat]
+                    z_loss = torch.logsumexp(valid_logits, dim=-1).pow(2).mean() * z_loss_weight
+                    loss = loss + z_loss
             
             if ponder_costs: 
                 ponder_cost_out = torch.stack(ponder_costs).mean()
+                if self.training:
+                    loss = loss + ponder_cost_out * getattr(self.config, 'ponder_loss_weight', 0.01)
             if commitment_costs: 
                 commitment_cost_out = torch.stack(commitment_costs).mean()
+                if self.training:
+                    loss = loss + commitment_cost_out * getattr(self.config, 'commitment_loss_weight', 0.05)
 
         return {
             "loss": loss, 
@@ -485,7 +546,7 @@ class HierarchosCore(nn.Module):
             "prev_context": prev_context,
             "target_context": target_context,
             "drift_state": final_drift,
-            "ltm_memory_state": (curr_fast_vals, curr_mom_vals),
+            "ltm_memory_state": (curr_fast_vals, curr_mom_vals, new_past_tokens),
         }
 
     def prepare_inputs_for_generation(self, input_ids, **kwargs):

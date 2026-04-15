@@ -30,10 +30,11 @@ def validate_loss(loss: torch.Tensor, name: str = "loss") -> bool:
 def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, running_states):
     """Training step with temporal chunking to match original hierarchos.py."""
     device = next(model.parameters()).device
-    full_input_ids = batch['input_ids'].to(device)
+    _nb = (device.type == 'cuda')  # non_blocking for async CUDA transfer
+    full_input_ids = batch['input_ids'].to(device, non_blocking=_nb)
     full_attention_mask = batch.get('attention_mask')
-    if full_attention_mask is not None: full_attention_mask = full_attention_mask.to(device)
-    full_labels = batch['labels'].to(device)
+    if full_attention_mask is not None: full_attention_mask = full_attention_mask.to(device, non_blocking=_nb)
+    full_labels = batch['labels'].to(device, non_blocking=_nb)
     
     # --- [NEW] Track Sequence Poisoning (Parity Fix) ---
     if torch.isnan(full_labels.float()).any():
@@ -46,6 +47,8 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
     h_state, l_state, prev_ctx, target_ctx, drift_state, ltm_state = running_states
     
     autocast_device = 'cpu' if is_directml_device(device) else device.type
+    amp_dtype_str = getattr(args, 'amp_dtype', None) or getattr(model.config if hasattr(model, 'config') else args, 'amp_dtype', 'float16')
+    amp_dtype = torch.bfloat16 if amp_dtype_str == 'bfloat16' else torch.float16
     
     # --- INFINTIE CONTEXT: STATE RECURRENCE ---
     # Default behavior (persist_state=False): carry states ONLY between TBPTT chunks 
@@ -76,7 +79,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
         if target_ctx is not None: target_ctx = target_ctx.detach()
         if drift_state is not None: drift_state = drift_state.detach()
         if ltm_state is not None: 
-            ltm_state = (ltm_state[0].detach(), ltm_state[1].detach())
+            ltm_state = tuple(s.detach() if isinstance(s, torch.Tensor) else s for s in ltm_state)
     
     # Temporal chunking (critical for RWKV-based models)
     chunk_size = getattr(args, 'training_chunk_size', 128)
@@ -99,7 +102,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
             attention_mask = full_attention_mask[:, start_t:end_t] if full_attention_mask is not None else None
             labels = full_labels[:, start_t:end_t]
             
-            with autocast(device_type=autocast_device, enabled=args.amp):
+            with autocast(device_type=autocast_device, dtype=amp_dtype, enabled=args.amp):
                 outputs = model(
                     input_ids=input_ids, attention_mask=attention_mask, labels=labels,
                     h_state=h_state, l_state=l_state, prev_context=prev_ctx,
@@ -265,6 +268,8 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
 
 def train(args, device, tokenizer, dataloader, dataloader_len):
     print("Running in TRAIN mode...")
+    if getattr(args, 'out_dir', None):
+        os.makedirs(args.out_dir, exist_ok=True)
     config = AttrDict(vars(args))
 
     # Device stability
@@ -278,11 +283,56 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         args.compile = True
         config.compile = True
 
+    # =================================================================
+    # CUDA DATACENTER OPTIMIZATIONS
+    # =================================================================
+    if device.type == 'cuda':
+        gpu_name = torch.cuda.get_device_name(device)
+        gpu_mem = torch.cuda.get_device_properties(device).total_mem / (1024**3)
+        gpu_capability = torch.cuda.get_device_capability(device)
+        print(f"INFO: CUDA GPU: {gpu_name} ({gpu_mem:.1f} GB, SM {gpu_capability[0]}.{gpu_capability[1]})")
+
+        # TF32 matmul (Ampere+, SM >= 8.0) — 3-8x faster matmuls with negligible accuracy loss
+        if gpu_capability[0] >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            print("INFO: TF32 matmul enabled (Ampere+ GPU detected).")
+
+        # cuDNN benchmark — auto-tunes convolution algorithms for the hardware
+        torch.backends.cudnn.benchmark = True
+
+        # Auto-enable AMP on CUDA if not explicitly disabled
+        if not getattr(args, 'amp', False):
+            args.amp = True
+            config.amp = True
+            print("INFO: AMP auto-enabled for CUDA training (use --no-amp to disable).")
+
+        # Auto-enable torch.compile on CUDA (no Windows CPU hang issue)
+        if not getattr(args, 'compile', False) and not getattr(args, 'force_compile', False):
+            args.compile = True
+            config.compile = True
+            print("INFO: torch.compile auto-enabled for CUDA training.")
+
+        # Prefer bfloat16 on Ampere+ for better dynamic range (no GradScaler needed)
+        if gpu_capability[0] >= 8 and torch.cuda.is_bf16_supported():
+            config.amp_dtype = 'bfloat16'
+            print("INFO: Using bfloat16 AMP (Ampere+ native support).")
+        else:
+            config.amp_dtype = 'float16'
+            print("INFO: Using float16 AMP with GradScaler.")
+
+        # Multi-GPU info
+        num_gpus = torch.cuda.device_count()
+        if num_gpus > 1:
+            print(f"INFO: {num_gpus} GPUs detected. For multi-GPU training, wrap with DistributedDataParallel.")
+    # =================================================================
+
     model = None
     optimizer = None
     start_epoch = 0
     scaler = None
     scheduler = None
+    checkpoint = None
     use_amp = getattr(args, 'amp', False)
     
     # 1. Loading/Resuming Logic
@@ -385,7 +435,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         # Original script uses 'completed_epoch', modular uses 'epoch', check both for compatibility
         start_epoch = checkpoint.get('completed_epoch', checkpoint.get('epoch', 0))
         print(f"Successfully loaded model state. Resuming from epoch {start_epoch + 1}.")
-        if use_amp:
+        if use_amp and getattr(config, 'amp_dtype', 'float16') != 'bfloat16':
             scaler = GradScaler()
             if 'scaler_state_dict' in checkpoint and not getattr(args, 'override_scheduling', False):
                 try: scaler.load_state_dict(checkpoint['scaler_state_dict'])
@@ -400,7 +450,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         if is_directml_device(device): optimizer = DirectMLAdamW(model.parameters(), lr=args.starting_lr)
         else: optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr)
         
-        if use_amp: scaler = GradScaler()
+        if use_amp and getattr(config, 'amp_dtype', 'float16') != 'bfloat16': scaler = GradScaler()
     
     else:
         print("Starting training from scratch.")
@@ -408,7 +458,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         model = HierarchosCore(config).to(device)
         if is_directml_device(device): optimizer = DirectMLAdamW(model.parameters(), lr=args.starting_lr)
         else: optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr)
-        if use_amp: scaler = GradScaler()
+        if use_amp and getattr(config, 'amp_dtype', 'float16') != 'bfloat16': scaler = GradScaler()
 
     # --- [NEW] Sync LTM reference chunk size (Parity Fix) ---
     training_chunk_size = getattr(args, 'training_chunk_size', 128)
@@ -591,8 +641,11 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     print("TRAINING COMPLETE!")
     print("="*60)
     
+    # Ensure output directory exists
+    os.makedirs(args.out_dir, exist_ok=True)
+    
     # Save inference-ready model (no optimizer/scheduler state = smaller file)
-    final_model_path = os.path.join(args.out_dir, "hierarchos_final.pt")
+    final_model_path = os.path.join(args.out_dir, "hierarchos.pt")
     print(f"Saving final inference model to: {final_model_path}")
     
     # Clean state dict (remove _orig_mod. prefix from compiled models)
@@ -609,6 +662,26 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     }
     save_checkpoint_safely(final_checkpoint, final_model_path)
     
+    # Save tokenizer files into the directory (HuggingFace-style portability)
+    try:
+        if tokenizer:
+            tokenizer.save_pretrained(args.out_dir)
+            print(f"Tokenizer files saved to {args.out_dir}")
+    except Exception as e:
+        print(f"Warning: Failed to save tokenizer: {e}")
+    
+    # Save config as JSON for easy inspection
+    try:
+        import json as json_module
+        config_path = os.path.join(args.out_dir, "hierarchos_config.json")
+        config_to_save = dict(model.config)
+        config_to_save['completed_epoch'] = args.epochs
+        with open(config_path, 'w') as f:
+            json_module.dump(config_to_save, f, indent=2, default=str)
+        print(f"Config saved to {config_path}")
+    except Exception as e:
+        print(f"Warning: Failed to save config JSON: {e}")
+    
     # Calculate final model size
     model_size_bytes = os.path.getsize(final_model_path)
     if model_size_bytes >= 1e9:
@@ -619,7 +692,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     print(f"Final model size: {size_str}")
     print(f"Total epochs completed: {args.epochs}")
     print(f"\nTo use the model for inference, run:")
-    print(f"  python hierarchos_cli.py chat --model-path \"{final_model_path}\"")
+    print(f"  python hierarchos_cli.py chat --model-path \"{args.out_dir}\"")
     print("="*60 + "\n")
 
 def finetune(args, device, tokenizer, dataloader, dataloader_len):

@@ -1,19 +1,34 @@
 -----
 
-# Hierarchos v0.17 (alpha): A Hybrid Memory-Reasoning Architecture
+# Hierarchos v0.18 (alpha): A Linear-Complexity Hierarchical Agent with RWKV v8 & Titans Memory
 
-**🎉 First Coherent Release!** — Hierarchos has successfully trained a 25M parameter model from scratch on Alpaca data, producing coherent instruction-following responses. See "Using Your Trained Model" below.
+**🧬 The "RWKV v8" Update** — Hierarchos has been upgraded from GRU-based cells to a full RWKV v8 backbone with linear attention, replacing O(T²) bottlenecks with O(1) inference cost. Combined with the Titans Neural Memory and a new CUDA auto-optimization pipeline, Hierarchos is now ready for datacenter-scale AGI training.
 
-A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
+A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) and RWKV linear attention to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
 -----
 
-### 🚀 **New in v0.17: The "Standardized Evaluation" Update**
+### 🚀 **New in v0.18: The "RWKV v8 & CUDA Datacenter" Update**
 
-- **LM-Evaluation-Harness Integration**: Run benchmarks like HellaSwag or ARC-Easy directly during training or after.
-- **Optional Dependency**: `lm-eval` is not required for core training, keeping the environment lightweight.
-- **Periodic Evaluation**: Use `--eval-steps` or `--eval-every-epoch` to track model logic progress throughout training.
-- **Step-Based Progress**: Trigger benchmarks every N steps (e.g., every 500 steps) for high-granularity progress tracking.
+#### 🧠 Architecture
+- **RWKV v8 Backbone**: Replaced GRU cells with full RWKV v8 (Receptance Weighted Key Value) cells featuring linear attention, Time Mixing with WKV recurrence, and SwiGLU Channel Mixing.
+- **DeepEmbed (4x Scale)**: New learnable token embeddings at 4× hidden dimension that gate the RWKV channel mixing FFN, providing richer per-token modulation.
+- **ROSA (Receptive Ordered Suffix Automaton)**: A neurosymbolic inner monologue — a CPU-side Suffix Automaton predicts likely next tokens, which are embedded and added to the input representation. Gives the model a "heads up" about upcoming patterns.
+- **V7 Backward Compatibility**: Set `use_deepembed=False, use_rosa=False` in config to run in pure V7 mode. All V7 checkpoints load cleanly.
+
+#### ⚡ CUDA Datacenter Optimizations (Zero Config)
+- **Auto-AMP**: Mixed precision auto-enables on CUDA — no `--amp` flag needed.
+- **bfloat16 on Ampere+**: SM ≥ 8.0 GPUs automatically use bfloat16 (better dynamic range, no GradScaler overhead).
+- **TF32 Matmul**: 3-8× faster linear layers on Ampere+ GPUs, enabled automatically.
+- **cuDNN Benchmark**: Auto-tunes convolution kernels for hardware.
+- **torch.compile Auto-Enable**: Worker loop compiled on CUDA (no Windows CPU hang issue).
+- **Non-blocking Transfers**: Host-to-device copies overlap with GPU computation via `non_blocking=True`.
+- **Pinned Memory**: DataLoader always uses `pin_memory=True` on CUDA.
+- **`--no-amp` Flag**: Explicitly disable AMP if needed.
+
+#### 🧪 Test Suite
+- **11/11 Tests Pass**: Full architectural validation including gradient flow, state continuity, training convergence, memory gradients, sampling logic, coherence, forward/backward, inference generation, V7 backward compat, LTM decay parity, and momentum amplification.
+- **Self-Contained Tests**: All tests create models in-memory — no hardcoded checkpoint paths.
 
 
 ## About The Project
@@ -24,16 +39,47 @@ This project introduces a novel hybrid model where a deep reasoning engine opera
 
 ## Core Concepts
 
-Hierarchos is built on two revolutionary, brain-inspired pillars:
+Hierarchos is built on three revolutionary, brain-inspired pillars:
+
+🔄 **RWKV v8 Backbone (The Neural Engine)**
+A modernized RNN with linear attention that achieves the parallel training speed of Transformers with the O(1) inference cost of RNNs. Features Time Mixing (WKV recurrence with exponential decay), SwiGLU Channel Mixing, DeepEmbed gating, and ROSA neurosymbolic embeddings.
 
 🧠 **Titans Architecture (The Cognitive Substrate)**
 A sophisticated, multi-tiered memory workspace that enables dynamic, lifelong learning. It learns *what to remember* based on the principle of "surprise," and its memory slots are now structured with timestamps and source metadata, allowing for sophisticated, context-aware queries.
 
 ⚙️ **Hierarchical Reasoning Model (The Cognitive Process)**
-A powerful, data-efficient, and deep reasoning engine. Its dual-module design (a high-level "CEO" and low-level "Workers") allows for profound computational depth through **iterative convergence**. This enables it to solve complex, multi-step algorithmic problems where massive LLMs fail, though the depth of reasoning directly impacts computational cost during training.
+A powerful, data-efficient, and deep reasoning engine. Its dual-module design (a high-level "Manager" and low-level "Worker") allows for profound computational depth through **iterative convergence**. This enables it to solve complex, multi-step algorithmic problems where massive LLMs fail.
+
+## Architecture Diagram
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ Input Tokens → tok_emb + ROSA(Suffix Automaton) + DeepEmbed(4x) │
+│                    ↓                                             │
+│ LTM Retrieval (differentiable top-k attention via qproj)         │
+│                    ↓                                             │
+│ Encoder → in_proj(GELU)                                         │
+│                    ↓                                             │
+│ Manager H-RNN (RWKV v8) ← l_feedback_proj                      │
+│   · ACT Pondering (shadow state, halt probabilities)            │
+│   · Strided Context Plan + LERP interpolation                   │
+│                    ↓                                             │
+│ Worker L-RNN (RWKV v8, torch.compiled on CUDA)                  │
+│   · Shadow-state exploration + convergence detection             │
+│   · Drift commitment cost                                       │
+│                    ↓                                             │
+│ out_norm → lm_head → Logits (weight-tied with tok_emb)          │
+│                    ↓                                             │
+│ Titans LTM Update (gradient-based surprise + Hebbian)           │
+│                    ↓                                             │
+│ CE Loss + Z-Loss + Ponder Cost + Commitment Cost                │
+└──────────────────────────────────────────────────────────────────┘
+```
 
 ## Features ✨
 
+  * 🔄 **RWKV v8 Backbone**: Linear-complexity attention with O(1) inference cost. WKV recurrence, SwiGLU FFN, DeepEmbed gating, and ROSA neurosymbolic embeddings.
+  * ⚡ **CUDA Datacenter Ready**: Auto-enables AMP (bfloat16 on Ampere+), TF32 matmul, cuDNN benchmark, torch.compile, non-blocking transfers, and pinned memory — zero configuration needed.
   * 📊 **Integrated Benchmarking**: Optional support for `lm-evaluation-harness`. Track model accuracy on standard benchmarks (HellaSwag, ARC, etc.) during or after training with `--eval-tasks`.
   * 🎮 **AMD GPU Support (DirectML/ZLUDA)**: Train on AMD Radeon GPUs using DirectML backend on Windows. Opt-in via `--device dml` with automatic compatibility handling and optimized fallbacks.
   * 🎓 **Proper Temporal Learning**: Configurable truncated BPTT (`--detach-every-n-steps`) enables learning across multiple timesteps while managing memory. Default 32-step gradients flow allows the model to **learn temporal dependencies** effectively.
@@ -42,22 +88,19 @@ A powerful, data-efficient, and deep reasoning engine. Its dual-module design (a
   * 🌐 **Hugging Face `datasets` Integration**: Load datasets directly from the HF Hub or local paths in various formats (CSV, Parquet, JSON, etc.) using `--hf_dataset`.
   * 💾 **Optimized Consolidated Chunk Loading**: Dramatically reduces RAM usage and speeds up training startup for large datasets using pre-processed, consolidated `.pt` tensor files and a manifest (`--pre_pt_dataset`). Includes file caching for efficiency.
   * 📜 **Iterable Dataset Support**: Option to load pre-chunked JSONL datasets line-by-line (`--pre_chunked_dataset`) for minimal memory overhead during training.
-  * ✂️ **Dataset Consolidation Script (`dataset_chunk_create.py`)**: Enhanced tool to prepare large datasets, chunking them into **consolidated `.pt` files** and creating a `manifest.jsonl` for efficient loading. Handles tokenization, anchoring, padding, and masking.
-  * 📉 **Gradient Checkpointing**: Significantly reduces VRAM usage during training/fine-tuning (`--gradient-checkpointing`), enabling larger models or batches on memory-constrained hardware by trading compute for memory.
+  * ✂️ **Dataset Consolidation Script (`dataset_chunk_create.py`)**: Enhanced tool to prepare large datasets, chunking them into **consolidated `.pt` files** and creating a `manifest.jsonl` for efficient loading.
+  * 📉 **Gradient Checkpointing**: Significantly reduces VRAM usage during training/fine-tuning (`--gradient-checkpointing`), enabling larger models or batches on memory-constrained hardware.
   * 🤔 **Adaptive "Ponder" Time**: Dynamically adjusts its reasoning depth, "thinking" longer for complex problems and saving computation on simpler ones.
   * 🕰️ **Structured & Queryable Memory**: LTM slots are augmented with timestamps and source data, enabling powerful temporal and contextual queries during chat.
   * 🧠 **Dynamic "Online" Learning**: Learns from experience during chat with a Cosine Annealing LR schedule by default for more stable knowledge consolidation.
-  * 🚀 **PyTorch 2.0+ torch.compile Support**: Optional compilation of the Worker loop with `--compile` for potential training speedups on NVIDIA GPUs and CPU (with `--force-compile`). Improved stability and performance on Windows.
-  * ⚡ **Accelerated Training with AMP**: Supports Automatic Mixed Precision (`--amp`) for faster training and reduced memory usage on compatible NVIDIA GPUs. Automatically disabled for DirectML and CPU for stability.
-  * 🛡️ **Stable Training**: Built-in gradient clipping (`--grad-clip`) to prevent model instability and ensure smoother convergence.
-  * 📦 **Self-Contained & Portable Models**: Models are saved as directories containing weights, tokenizer, and architecture config for easy sharing and use.
+  * 🚀 **PyTorch 2.0+ torch.compile Support**: Auto-enabled on CUDA, optional on CPU with `--compile` / `--force-compile`.
+  * 🛡️ **Stable Training**: Built-in gradient clipping (`--grad-clip`), Z-loss regularization, and state clamping to prevent instability.
+  * 📦 **Self-Contained & Portable Models**: Models are saved as HuggingFace-style directories containing weights, tokenizer, and architecture config for easy sharing and deployment.
   * 💾 **Automatic Re-quantization**: After a learning session, Hierarchos can automatically re-quantize a model to persist the new knowledge (`--enable-quantized-learning` in `chat`). *(Requires compiled kernel)*
-  * 🌱 **Enhanced Model Expansion**: Includes `expand_model.py` script to transplant weights from smaller models to larger ones, now supporting changes in `max_length` and automatic length detection from datasets.
-  * ✨ **Flexible Training Initiation**: Supports starting training runs using weights from existing model directories (inference or expanded models via `--model-path` in `train` mode), not just resuming full training checkpoints (`--resume-from-ckpt`).
+  * 🌱 **Enhanced Model Expansion**: Includes `expand_model.py` script to transplant weights from smaller models to larger ones.
   * ⚡ **High-Performance Inference**: Utilizes a custom C++ kernel inspired by `llama.cpp` for state-of-the-art quantization (`INT4`, `Q4_0`, `Q8_0`, `Q2_K`). *(Requires compiled kernel)*
-  * 💻 **CPU & GPU Support**: Runs fast quantized inference on standard CPUs (with AVX/NEON) or on GPUs via Vulkan for broad hardware compatibility. *(Requires compiled kernel)*
-  * 🔧 **Comprehensive Tooling**: Includes a single script (`hierarchos.py`) for training, LoRA fine-tuning, merging, quantization, and interactive chat, plus the model expansion and dataset chunking scripts.
-  * 🐍 **Python 3.13 Support**: Full compatibility with Python 3.13, including automatic build environment setup and path detection.
+  * 💻 **CPU & GPU Support**: Runs quantized inference on CPUs (AVX/NEON) or GPUs via Vulkan. *(Requires compiled kernel)*
+  * 🐍 **Python 3.13 Support**: Full compatibility with Python 3.13, including automatic build environment setup.
 
 -----
 
@@ -259,9 +302,10 @@ python hierarchos_cli.py train \
 
 -----
 
-💡 **Accelerating Training with AMP:** Use `--amp` for faster training and lower VRAM usage on NVIDIA GPUs. Automatically disabled for DirectML and CPU.
+💡 **CUDA Auto-Optimization:** On NVIDIA GPUs, AMP, TF32, cuDNN benchmark, and torch.compile are **auto-enabled** — no flags needed. Use `--no-amp` to disable.
 💾 **Training on Low Memory:** Use `--gradient-checkpointing` to significantly reduce VRAM usage at the cost of some extra computation.
 🎮 **AMD GPU Training:** Use `--device dml` to train on AMD Radeon GPUs via DirectML. AMP is automatically disabled for stability.
+🚀 **Datacenter Training:** `--num_workers 8 --batch_size 32 --training-chunk-size 512 --persist-state` for maximum GPU utilization.
 
 ## ⚠️ **HRM Convergence & Training Speed:** Higher `--max_h_steps` and `--max_l_steps` allow deeper reasoning but **significantly increase training time** per batch due to the iterative HRM process. Adjust based on your task and compute resources.
 
@@ -513,9 +557,10 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-
 | `--min-lr`                     | `train`, `finetune`                 | Minimum Learning Rate for cosine annealing schedule.                                                                                     | `1e-6`                  |
 | `--disable-lr-schedule`        | `train`, `finetune`                 | Use a fixed Learning Rate (`--starting-lr`) instead of cosine annealing.                                                                 | `False`                 |
 | `--ltm_lr`                     | `train`, `finetune`, `chat`         | Learning Rate for LTM "surprise" updates (or max LR for LTM schedule in chat).                                                         | `0.01`                  |
-| `--compile`                    | `train`, `finetune`                 | **Enable torch.compile for faster training (experimental).**                                                                              | `False`                 |
+| `--compile`                    | `train`, `finetune`                 | **Enable torch.compile (auto-enabled on CUDA).**                                                                              | `False`                 |
 | `--force-compile`              | `train`, `finetune`                 | Force torch.compile even on Windows CPU (overrides safety check).                                                                         | `False`                 |
-| `--amp`                        | `train`, `finetune`, `chat`         | **Enable Automatic Mixed Precision (requires CUDA).**                                                                                     | `False`                 |
+| `--amp`                        | `train`, `finetune`, `chat`         | **Enable Automatic Mixed Precision (auto-enabled on CUDA).**                                                                                     | `False`                 |
+| `--no-amp`                     | `train`, `finetune`                 | **Explicitly disable AMP** (overrides auto-detection on CUDA).                                                                                   | N/A                     |
 | `--num_workers`                | `train`, `finetune`                 | Number of CPU workers for data loading (and HF dataset mapping if applicable).                                                         | `0`                     |
 | `--lora_r`                     | `finetune`                          | LoRA rank 'r'.                                                                                                                           | `8`                     |
 | `--lora_alpha`                 | `finetune`                          | LoRA alpha scaling factor.                                                                                                               | `16`                    |\n| `--finetune-unlock-percent`    | `finetune`                          | Target % of params to train (approx.). Overrides `--lora_r` if set.                                                                     | `None`                  |
@@ -576,9 +621,11 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-
 
   * [ ] Develop a user-friendly GUI wrapper for easier interaction.
   * [ ] Extend the architecture to support multi-modal inputs (images, audio).
+  * [ ] Implement multi-GPU training with DistributedDataParallel / FSDP.
   * [ ] Implement the entire training loop in Vulkan/CUDA for end-to-end GPU acceleration.
   * [ ] Expand DirectML support to Linux via ROCm.
   * [ ] Optimize LTM retrieval with approximate nearest neighbor search for larger memory capacities.
+  * [ ] Explore RWKV v8 custom CUDA kernels for fused WKV computation.
 
 ## License
 
@@ -593,6 +640,7 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
 ## Acknowledgements
 
   * This architecture is inspired by the concepts in Google's **Titans** and Sapient Intelligence's **HRM** papers.
+  * **RWKV** architecture by BlinkDL — linear attention with RNN efficiency.
   * The quantization kernel design is heavily influenced by the groundbreaking work in **llama.cpp**.
   * **pybind11** for seamless C++/Python integration.
   * **Hugging Face `datasets`** library for broad data compatibility.
@@ -600,6 +648,37 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **DirectML/ZLUDA communities** for enabling AMD GPU acceleration on Windows.
 
 ## Changelog
+
+### v0.18 (alpha)
+
+  * **🧠 RWKV v8 Backbone**: Complete replacement of GRU cells with RWKV v8 cells featuring:
+      * **Time Mixing**: WKV (Weighted Key Value) recurrence with exponential decay and `time_first` / `time_decay` learnable parameters.
+      * **Channel Mixing**: SwiGLU-gated feed-forward network with 4× expansion.
+      * **5-Slot State**: `(sx, aa, bb, pp, sx_cm)` replaces the old 3-slot GRU state for richer temporal representation.
+      * **Float32 WKV**: Critical exponential calculations run in float32 for numerical stability, even under AMP.
+  * **🎨 DeepEmbed (4× Scale)**: New `h_deepemb` and `l_deepemb` embeddings at `hidden_dim × 4` that gate the RWKV channel mixing FFN, providing per-token modulation of the feed-forward pathway.
+  * **🔮 ROSA (Receptive Ordered Suffix Automaton)**: A neurosymbolic inner monologue module:
+      * CPU-side Suffix Automaton predicts likely next tokens from input history.
+      * Predictions are embedded via `rosa_emb` and added to the input representation.
+      * Gives the model a "heads up" about upcoming patterns (O(n) precomputation).
+      * `past_tokens` state maintained across inference turns for continuity.
+  * **⚡ CUDA Datacenter Auto-Optimization** (zero config):
+      * **AMP auto-enable**: Mixed precision activates on CUDA without `--amp` flag.
+      * **bfloat16 on Ampere+**: SM ≥ 8.0 GPUs use bf16 (no GradScaler overhead).
+      * **TF32 matmul**: 3-8× faster linear layers on Ampere+.
+      * **cuDNN benchmark**: Auto-tunes kernel selection for hardware.
+      * **torch.compile auto-enable**: Worker loop compiled on CUDA.
+      * **Non-blocking transfers**: `to(device, non_blocking=True)` for async H2D.
+      * **pin_memory always on CUDA**: Regardless of num_workers.
+      * **drop_last on CUDA**: Prevents irregular batch OOM.
+  * **🧪 Test Suite Modernized**: 11/11 tests pass. Rewrote 3 stale tests (`test_forward.py`, `test_inference.py`, `verify_parity_deep.py`) to be self-contained — create models in-memory instead of loading hardcoded checkpoints.
+  * **🛡️ Stability Hardening**:
+      * `ltm_state` detach handles both 2-tuple and 3-tuple formats (forward compat).
+      * `verify_ltm_decay.py` and `verify_momentum_inference.py` fixed for correct tuple unpacking.
+  * **🔙 V7 Backward Compatibility**: Setting `use_deepembed=False, use_rosa=False` produces a valid V7 model. All V7 checkpoints load cleanly.
+  * **📦 HuggingFace Directory Output Restored**: Training exports `hierarchos.pt` + full tokenizer suite + `hierarchos_config.json` in a self-contained directory.
+  * **🆕 CLI Additions**: `--no-amp` flag, improved help text for `--amp`, `--compile`, `--num_workers`.
+  * **📊 GPU Diagnostics**: Training startup prints GPU name, VRAM, SM version, and all auto-enabled optimizations.
 
 ### v0.17 (alpha)
 
@@ -620,142 +699,7 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **Checkpoint Converter**: `ckpt-2-inf` mode for HuggingFace-style directories
   * **First Coherent Release**: 25M model trained on Alpaca produces coherent output
 
-### v0.15.2 (alpha)
-
-  * **ACT Sensitivity Fixes**:
-      * **Surgical Halt Bias Reset**: Added `--reset-halt-bias` to directly reset `h_halt_proj.bias` on checkpoint load, immediately fixing "ponder stickiness" where ACT gets stuck at minimal values.
-      * **Encourage Thinking Mode**: Added `--encourage-thinking` flag to invert ponder loss (reward thinking instead of penalize).
-      * **Adaptive Ponder Targeting**: Added `--adaptive-ponder` with `--ponder-target-scale` to automatically scale target ponder with CE loss.
-  * **Training Visibility**:
-      * **Model Stats Display**: Training now prints total/trainable parameter count and estimated checkpoint size at startup.
-
-### v0.15 (alpha)
-
-  * **Modular Architecture**: Reorganized `hierarchos.py` into `hierarchos/` package. Added `hierarchos_cli.py` as recommended entry point.
-  * **Training Loop Parity**: Implemented 128-token temporal chunking with TBPTT, per-batch state reset, and full forward parity with original.
-
-### v0.14 (alpha)
-
-  * **Critical Training Fix**:
-      * **Fixed Positional Jitter**: Passed `global_pos_offset` in the training loop. This ensures the Manager's stride/interpolation logic is continuous across chunk boundaries, resolving the 1.92 loss plateau.
-  * **Architecture & Learning**:
-      * **Differentiable Ponder Cost**: Switched to a differentiable ACT sum (`cum_remain.sum()`), enabling the model to learn halting efficiency.
-  * **Chat & Recovery**:
-      * **Incremental Generation**: Refactored chat to use prefill + single-token steps for perfect RNN state management.
-      * **Full State Reset**: Added `/reset` command to zero out all internal states (h_state, l_state, context, drift).
-      * **Thorough LTM Reset**: Updated `/reset_ltm` to clear all memory buffers including timestamps and sources.
-      * **State Persistence**: Fixed a bug where hierarchical states were being reset during incremental steps.
-
-### v0.13.10 (alpha)
-
-### v0.13.5 (alpha)
-
-  * **Coherence & Stability Fixes**:
-      * **Fixed Manager Stride Logic**: Corrected the Manager's strided update check to use global position instead of local chunk index, eliminating drift between training (chunked) and inference (sequential).
-      * **Unified Lerp Interpolation**: Updated the context interpolation (Lerp) to use global position, ensuring smooth and consistent context transitions in all modes.
-      * **LTM Persistence**: Verified and fixed persistence of LTM `fast_vals` and `mom_vals` during inference, enabling reliable test-time learning.
-      * **Chat Engine Update**: Updated `chat` function to pass `global_pos_offset` to the full-precision model, propagating coherence fixes to interactive sessions.
-
-### v0.13.0 (alpha)
-
-  * **Interactive Sampling Parameters**:
-      * Added `/temp <float>`, `/topk <int>`, and `/topp <float>` commands to `chat` mode for dynamic control over generation creativity.
-      * Added `/settings` command to view current sampling parameters.
-  * **LTM Stability & Persistence Fixes**:
-      * **Fixed Gradient Flow**: Resolved a critical issue where LTM gradients were detached, preventing the model from learning to use its memory effectively during training.
-      * **Fixed Passive Updates**: Corrected a logic error that caused the model to skip generation after passive memory updates.
-      * **Crash Fixes**: Resolved `NameError` and `TypeError` in the LTM update routine.
-
-### v0.12.0 (alpha)
-
-  * **DirectML Support (AMD GPU Acceleration)**:
-      * Added native support for AMD Radeon GPUs on Windows via DirectML backend
-      * Implemented device auto-detection with explicit opt-in via `--device dml` or `--device directml`
-      * Auto-disables AMP for DirectML devices for stability
-      * Added DirectML-compatible implementations for operations (replaced `torch.lerp`, `torch.index_add_`, etc.)
-      * Prevents custom kernel loading on DirectML devices to avoid incompatibilities
-      * Includes comprehensive compatibility checks and optimized fallbacks
-  * **LTM Memory Optimization & Stability**:
-      * Refactored `LTMModule.inner_update` to use in-place operations, significantly reducing memory overhead
-      * Fixed LTM memory persistence bug where updates were calculated but not saved during training
-      * Added LTM value clamping `[-20, 20]` to prevent saturation and numerical instability
-      * Improved surprise-based update mechanism for more stable memory consolidation
-  * **Python 3.13 Support**:
-      * Updated `setup.bat` and `setup.ps1` to fully support Python 3.13
-      * Added automatic detection for various Python installation paths (PATH, standard, Windows Store, `py` launcher)
-      * Fixed C++ compilation issues related to spaces in Python installation paths
-      * Added Python libs path to LIB environment variable for successful kernel compilation
-  * **torch.compile Stability Improvements**:
-      * Fixed device detection for `torch.compile` - now correctly identifies device type for autocast
-      * Improved dynamic shape support on Windows CPU
-      * Added `--force-compile` safety check with better warnings
-      * Fixed compilation errors related to NaN checks in worker loop
-      * Improved compatibility with Windows CPU compilation
-  * **Enhanced Device Management**:
-      * Improved `pick_device()` auto-detection logic with priority: CUDA → CPU (DirectML is opt-in)
-      * Added `is_directml_device()` and `get_device_type()` utility functions
-      * DirectML now requires explicit opt-in to prevent accidental use with incompatible operations
-      * Better handling of device selection in training and inference modes
-  * **Numerical Stability Fixes**:
-      * Added comprehensive state clamping in `_worker_loop` to prevent NaN propagation
-      * Added `gate_input` clamping before sigmoid operations
-      * Improved stability checks for convergence detection
-      * Added safety guards for AMP/DirectML compatibility in RWKV cells
-  * **MSVC Build Environment Improvements**:
-      * Enhanced `setup_msvc_environment()` with better vswhere.exe integration
-      * Added automatic vcvars64.bat path detection and caching
-      * Fixed vcvarsall.bat environment variable parsing
-      * Improved error handling and user guidance for manual compiler setup
-  * **Performance Optimizations**:
-      * Reduced memory allocations in LTM update paths
-      * Improved gradient computation efficiency during training
-      * Better cache utilization in dataset loading
-  * **Documentation Updates**:
-      * Added DirectML setup instructions and workflow examples
-      * Updated command-line reference with device selection options
-      * Added notes on AMP auto-disable for DirectML and CPU
-      * Enhanced troubleshooting guidance for various hardware configurations
-
-### v0.11.15 (alpha)
-
-  * **Critical Inference Fixes**:
-      * **Worker Loop Correction**: Fixed logic error in `QuantizedHierarchos` where the RNN state was advanced multiple times per token. Now uses shadow state for pondering, matching training behavior.
-      * **Memory Persistence**: Fixed bug where LTM updates were discarded during inference. Now correctly persists `fast_vals` and `mom_vals` to buffers.
-      * **Manager Pondering (ACT)**: Implemented Manager Pondering in `QuantizedHierarchos` to match training logic, resolving drift discrepancy.
-      * **Verified Coherence**: Drift dynamics now match between training and inference. Verified with stable training convergence.
-
-### v0.11.5 (alpha)
-
-  * **Coherence & Stability Fixes**:
-      * **Fixed Drift Discrepancy**: Aligned training/inference logic for Context Drift. Training now correctly initializes drift from the previous hidden state, eliminating token-to-token jitter.
-      * **LTM Clamping**: Added value clamping `[-20, 20]` to LTM updates to prevent saturation.
-      * **Fixed torch.compile Regression**: Resolved a `TypeError` in the worker loop's NaN check that prevented compilation.
-
-### v0.11.0 (alpha)
-
-  * **Critical Gradient Flow Fixes**:
-      * **Implemented Configurable Truncated BPTT**: Replaced unconditional state detachment in RWKV cells with proper truncated Back-Propagation Through Time. Added `--detach-every-n-steps` parameter (default: 32) to control gradient flow across timesteps.
-      * **Fixed Worker Loop Shadow State**: Removed detachment in Worker (L-RNN) pondering loop that was breaking gradient flow. The Worker now learns to ponder effectively through proper gradient propagation.
-      * **Fixed Manager State Flow**: Manager (H-RNN) now properly receives gradients from Worker feedback via `l_feedback_proj`. Hierarchical reasoning can learn from both architectural levels.
-      * **Comprehensive Test Suite**: Added `test_gradient_flow.py` with 3 validation tests proving gradient flow, state continuity, and training convergence (22.8% loss reduction in 20 steps).
-  * **Training Improvements**:
-      * Gradients now flow properly through all critical components (tok_emb, h_rnn, l_rnn, ltm).
-      * Fixed train/test mismatch from unconditional detachment, improving model coherence.
-      * No more NaN/Inf errors or training hangs with proper gradient management.
-      * State values remain numerically stable (< 3.0) with smooth transitions between batches.
-  * **Architecture Changes**:
-      * RWKV cells now accept `timestep` parameter for proper BPTT control.
-      * Negative timesteps used for pondering loops to prevent detachment during exploration.
-      * Removed redundant state clamping operations in Manager flow.
-      * Improved torch.compile compatibility with better handling of dynamic control flow.
-  * **Updated Documentation**: Added comprehensive walkthrough of fixes, added new features to README, updated command-line reference with `--detach-every-n-steps`, `--compile`, and `--force-compile` flags.
-
-### v0.10.0 (alpha)
-
-  * **Hinge Loss:** Implemented `ReLU(drift - threshold)` to prevent Posterior Collapse.
-  * **Commitment Control:** Added tunable threshold and weights for drift regularization.
-
-*(Older changelog entries have been archived for brevity. See git history for versions prior to v0.10.)*
+*(Older changelog entries have been archived for brevity. See git history for versions prior to v0.16.)*
 
 -----
 
