@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from hierarchos import HierarchosCore
+from hierarchos import HierarchosCore, AttrDict
 
 def test_l_state_gradient_flow_isolated():
     print("\n=== Test: Worker State Gradient Flow (Isolated) ===")
@@ -25,7 +25,7 @@ def test_l_state_gradient_flow_isolated():
         'detach_every_n_steps': 100
     }
     
-    model = HierarchosCore(config)
+    model = HierarchosCore(AttrDict(config))
     model.train()
     
     B, T = 1, 5

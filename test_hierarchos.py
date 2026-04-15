@@ -30,7 +30,7 @@ def test_training_step():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    model = HierarchosCore(config).to(device)
+    model = HierarchosCore(AttrDict(config)).to(device)
     model.train()
     
     # Create dummy batch
@@ -103,7 +103,7 @@ def test_compile():
     }
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = HierarchosCore(config).to(device)
+    model = HierarchosCore(AttrDict(config)).to(device)
     model.train()
     
     B, T = 2, 32

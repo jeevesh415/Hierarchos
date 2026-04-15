@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from hierarchos import HierarchosCore
+from hierarchos import HierarchosCore, AttrDict
 
 def test_l_state_gradient_flow():
     print("\n=== Test: Worker State Gradient Flow Depth ===")
@@ -25,7 +25,7 @@ def test_l_state_gradient_flow():
         'detach_every_n_steps': 100 # Set high to avoid intended TBPTT for this test
     }
     
-    model = HierarchosCore(config)
+    model = HierarchosCore(AttrDict(config))
     model.train()
     
     B, T = 1, 5

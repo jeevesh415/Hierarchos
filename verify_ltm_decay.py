@@ -42,7 +42,7 @@ def test_ltm_decay_parity():
     # If we pass vals=0, slot_updates=0.
     vals_zero = torch.zeros_like(vals)
     
-    fast_vals_infer = ltm.update_memory_hebbian(
+    fast_vals_infer, _ = ltm.update_memory_hebbian(
         topk_idx, 
         keys=None, 
         vals=vals_zero, 

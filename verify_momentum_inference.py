@@ -1,26 +1,29 @@
 import torch
 import torch.nn as nn
-from hierarchos import HierarchosCore
+from hierarchos import HierarchosCore, AttrDict
 
 def test_momentum_inference():
     print("=== Test: Momentum in Inference LTM Updates ===")
     
-    config = dict(
+    config = AttrDict(
         vocab_size=100,
-        context_dim=32, # Renamed from n_embd to match HierarchosCore
-        persistent_dim=32, # Added required
-        ltm_slots=100, # Renamed
+        context_dim=32,
+        persistent_dim=32,
+        ltm_slots=100,
         ltm_key_dim=32,
         ltm_val_dim=32,
         ltm_topk=1, 
         ltm_lr=0.1,
         ltm_momentum=0.9, 
-        ltm_forget_rate=0.0, # Renamed from alpha
+        ltm_forget_rate=0.0,
         h_hidden=32,
         l_hidden=32,
+        h_stride=2,
         max_h_steps=2,
         max_l_steps=2,
         l_conv_atol=1e-4,
+        use_deepembed=False,
+        use_rosa=False,
         device='cpu'
     )
     
