@@ -141,8 +141,11 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
                 ids = p_ids + t_ids + r_ids + [tokenizer.eos_token_id]
                 labels = ([-100] * len(p_ids)) + t_ids + r_ids + [tokenizer.eos_token_id]
             else:
-                inp = str(text_dict.get('input', ""))
-                prompt = f"### Instruction:\n{instruction}\n\n### Input:\n{inp}\n\n### Response:\n" if inp else f"### Instruction:\n{instruction}\n\n### Response:\n"
+                inp = str(text_dict.get('input', "")).strip()
+                if inp:
+                    prompt = f"User: {inp}\n\nUser: {instruction}\n\nAssistant: "
+                else:
+                    prompt = f"User: {instruction}\n\nAssistant: "
                 p_ids = tokenizer.encode(prompt)
                 c_ids = tokenizer.encode(output, add_special_tokens=False)
                 ids = p_ids + c_ids + [tokenizer.eos_token_id]
@@ -158,6 +161,9 @@ class OriginalJSONLDataset(Dataset):
         self.tokenizer, self.max_length, self.kayla_mode, self.samples = tokenizer, max_length, kayla_mode, []
         with open(path, "r", encoding="utf-8") as f:
             for line in tqdm(f, desc="Loading JSONL"):
+                line = line.strip()
+                if not line: continue
+                # Pass kwargs explicitly to allow overriding in the CLI
                 processed = process_text_sample(tokenizer, json.loads(line), max_length, kayla_mode, prompt_column='instruction', completion_column='output')
                 if processed: self.samples.append(processed)
     def __len__(self): return len(self.samples)
@@ -186,6 +192,8 @@ def _collate_fn_dynamic_padding(batch, pad_token_id):
 
 def create_map_style_dataloader(dataset, batch_size, pad_token_id, num_workers=0, shuffle=True):
     collate = functools.partial(_collate_fn_dynamic_padding, pad_token_id=pad_token_id)
+    use_cuda = torch.cuda.is_available()
     return DataLoader(dataset, batch_size=batch_size, collate_fn=collate, shuffle=shuffle,
-                      num_workers=num_workers, pin_memory=(torch.cuda.is_available() and num_workers > 0),
-                      persistent_workers=(num_workers > 0))
+                      num_workers=num_workers, pin_memory=use_cuda,
+                      persistent_workers=(num_workers > 0),
+                      drop_last=(use_cuda and len(dataset) > batch_size))
