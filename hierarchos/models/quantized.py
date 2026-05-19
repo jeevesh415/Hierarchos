@@ -138,13 +138,12 @@ class QuantizedRWKVCell:
             if p.device.type != device:
                 p.data = p.data.to(device)
 
-        # Capture input for next Time Mixing state (Token Shift)
-        x_in = x 
-
         sx, aa, bb, pp, sx_cm = state.unbind(dim=2)
 
         # --- Time mixing ---
+        # COH #2: x_norm stored in state slot 0 (matches full model's rwkv_cell.py)
         x_norm = F.layer_norm(x, (self.n_embd,), weight=self.ln1_w, bias=self.ln1_b)
+        x_in = x_norm  # This is what gets stored in slot 0
 
         xk = x_norm * self.time_mix_k + sx * (1 - self.time_mix_k)
         xv = x_norm * self.time_mix_v + sx * (1 - self.time_mix_v)
@@ -163,9 +162,6 @@ class QuantizedRWKVCell:
         
         # Time Mixing Output / Channel Mixing Input
         x = x + self.output(r * wkv, device)
-        
-        # Capture input for next Channel Mixing state
-        x_tm = x 
 
         ww = pp + self.time_decay
         p = torch.maximum(ww, k)
@@ -176,17 +172,19 @@ class QuantizedRWKVCell:
         pp = p
 
         # --- Channel mixing ---
+        # COH #2: x_norm2 stored in state slot 4 (matches full model's rwkv_cell.py)
         x_norm2 = F.layer_norm(x, (self.n_embd,), weight=self.ln2_w, bias=self.ln2_b)
 
         xk = x_norm2 * self.time_mix_k_cm + sx_cm * (1 - self.time_mix_k_cm)
         xr = x_norm2 * self.time_mix_r_cm + sx_cm * (1 - self.time_mix_r_cm)
         
         r = torch.sigmoid(self.receptance_cm(xr, device))
-        k = torch.square(torch.relu(self.key_cm(xk, device)))
+        key_out = self.key_cm(xk, device)
+        k = F.silu(key_out) * torch.relu(key_out)
         x = x + r * self.value_cm(k, device)
 
-        # Update state: [x_in, aa, bb, pp, x_tm]
-        new_state = torch.stack([x_in, aa, bb, pp, x_tm], dim=2)
+        # Update state: [x_in(=x_norm), aa, bb, pp, x_norm2] — aligned with full model
+        new_state = torch.stack([x_in, aa, bb, pp, x_norm2], dim=2)
         return x, new_state
 
 class QuantizedHierarchos:
@@ -215,7 +213,12 @@ class QuantizedHierarchos:
             self.ltm = LTMModule(n_slots=self.config.ltm_slots,
                                  key_dim=self.config.ltm_key_dim,
                                  val_dim=self.config.ltm_val_dim,
-                                 reference_chunk_len=getattr(self.config, 'reference_chunk_len', 128))
+                                 lr=getattr(self.config, 'ltm_lr', 1e-3),
+                                 momentum=getattr(self.config, 'ltm_momentum', 0.9),
+                                 wd=getattr(self.config, 'ltm_weight_decay', 1e-4),
+                                 forget_rate=getattr(self.config, 'ltm_forget_rate', 0.01),
+                                 reference_chunk_len=getattr(self.config, 'reference_chunk_len', getattr(self.config, 'training_chunk_size', 128)),
+                                 score_grad_scale=getattr(self.config, 'ltm_score_grad_scale', 1.0))
                                  
             ltm_state = {}
             for k in ['ltm.keys', 'ltm.vals', 'ltm.timestamps', 'ltm.sources']:
@@ -276,9 +279,44 @@ class QuantizedHierarchos:
                  h_state: torch.Tensor, l_state: torch.Tensor, 
                  prev_context: torch.Tensor, target_context: torch.Tensor,
                  global_pos_offset: int = 0,
-                 device: str = "cpu", min_timestamp: float = 0.0, source_filter: int = None):
+                 device: str = "cpu", min_timestamp: float = 0.0, source_filter: int = None,
+                 drift_state=None, ltm_memory_state=None, **kwargs):
         
         B, T = input_ids.shape
+        allow_hebbian_update = kwargs.pop("allow_hebbian_update", False)
+        suppress_hebbian = kwargs.pop("suppress_hebbian", getattr(self, "suppress_hebbian", True))
+        if allow_hebbian_update:
+            suppress_hebbian = False
+        memory_timestamps = None
+        memory_sources = None
+        if ltm_memory_state is None:
+            isolate_batch_ltm = getattr(self.config, 'isolate_batch_ltm', True) and B > 1
+            if isolate_batch_ltm:
+                curr_fast_vals = self.ltm.fast_vals.unsqueeze(0).expand(B, -1, -1).clone()
+                curr_mom_vals = self.ltm._mom_vals.unsqueeze(0).expand(B, -1, -1).clone()
+                memory_timestamps = self.ltm.timestamps.unsqueeze(0).expand(B, -1).clone()
+                memory_sources = self.ltm.sources.unsqueeze(0).expand(B, -1).clone()
+            else:
+                curr_fast_vals = self.ltm.fast_vals
+                curr_mom_vals = self.ltm._mom_vals
+                memory_timestamps = self.ltm.timestamps
+                memory_sources = self.ltm.sources
+        else:
+            if len(ltm_memory_state) >= 6:
+                curr_fast_vals, curr_mom_vals, _, _, memory_timestamps, memory_sources = ltm_memory_state[:6]
+            elif len(ltm_memory_state) >= 2:
+                curr_fast_vals, curr_mom_vals = ltm_memory_state[:2]
+            else:
+                curr_fast_vals = self.ltm.fast_vals
+                curr_mom_vals = self.ltm._mom_vals
+            if memory_timestamps is None:
+                if curr_fast_vals.dim() == 3:
+                    memory_timestamps = self.ltm.timestamps.unsqueeze(0).expand(curr_fast_vals.shape[0], -1).clone()
+                    memory_sources = self.ltm.sources.unsqueeze(0).expand(curr_fast_vals.shape[0], -1).clone()
+                else:
+                    memory_timestamps = self.ltm.timestamps
+                    memory_sources = self.ltm.sources
+
         curr_prev_context = prev_context.to(device if device == 'vulkan' else 'cpu')
         logits = None
         stride = self.config.h_stride
@@ -293,6 +331,16 @@ class QuantizedHierarchos:
                 
         curr_prev_context = prev_context.to(device if device == 'vulkan' else 'cpu')
         curr_target_context = target_context.to(device if device == 'vulkan' else 'cpu')
+
+        drift_seed = None
+        if drift_state is not None:
+            drift_seed = drift_state.to(device if device == 'vulkan' else 'cpu')
+            if drift_seed.dim() == 1:
+                drift_seed = drift_seed.unsqueeze(0)
+            if drift_seed.shape[0] == 1 and B > 1:
+                drift_seed = drift_seed.expand(B, -1)
+            if drift_seed.shape != (B, self.config.context_dim):
+                drift_seed = None
         
         all_topk_vals, all_topk_idx = [], []
 
@@ -311,7 +359,10 @@ class QuantizedHierarchos:
             query = torch.clamp(query, min=-10.0, max=10.0)
             topk_vals, topk_idx, topk_ts = self.ltm.retrieve_topk(query, topk=self.config.ltm_topk, 
                                                            min_timestamp=min_timestamp, 
-                                                           source_filter=source_filter)
+                                                           source_filter=source_filter,
+                                                           fast_vals=curr_fast_vals,
+                                                           timestamps=memory_timestamps,
+                                                           sources=memory_sources)
             all_topk_vals.append(topk_vals); all_topk_idx.append(topk_idx)
             
             args = topk_ts.unsqueeze(-1) * self.time_freqs.to(device).unsqueeze(0).unsqueeze(0)
@@ -364,7 +415,9 @@ class QuantizedHierarchos:
             alpha = (abs_t % stride) / float(stride)
             static_context = curr_prev_context + (curr_target_context - curr_prev_context) * alpha
 
-            if self.context_drift_proj is not None:
+            if t == 0 and drift_seed is not None:
+                current_drift = torch.clamp(drift_seed.to(device), min=-5.0, max=5.0)
+            elif self.context_drift_proj is not None:
                 current_drift = torch.clamp(torch.tanh(self.context_drift_proj(l_state[:, :, 0].to(device), device=device)), min=-5.0, max=5.0)
             else:
                 current_drift = torch.zeros_like(static_context)
@@ -385,16 +438,34 @@ class QuantizedHierarchos:
             enc = enc + self.l_to_out(l_out, device=device)
             logits = self.lm_head(self.out_norm(enc.cpu()), device=device)
 
-            if self.val_proj is not None:
+            if self.val_proj is not None and not suppress_hebbian:
                  val_to_store = self.val_proj(enc.to(device), device=device) if hasattr(self.val_proj, 'qtype') else self.val_proj(enc.to(device))
                  val_expanded = torch.clamp(val_to_store, min=-20.0, max=20.0).unsqueeze(1).expand(-1, self.config.ltm_topk, -1)
-                 self.ltm.update_memory_hebbian(topk_idx, None, val_expanded, current_lr=self.config.ltm_lr, timestamp=float(abs_t), tokens_covered=1, inplace=True)
+                 curr_fast_vals, curr_mom_vals = self.ltm.update_memory_hebbian(
+                     topk_idx, None, val_expanded,
+                     current_lr=self.config.ltm_lr,
+                     timestamp=float(abs_t),
+                     tokens_covered=1,
+                     fast_vals=curr_fast_vals,
+                     mom_vals=curr_mom_vals,
+                     timestamps=memory_timestamps,
+                     sources=memory_sources,
+                     inplace=True
+                 )
 
         return {
             "logits": logits.unsqueeze(1) if logits is not None else None,
             "h_state": h_state.cpu(), "l_state": l_state.cpu(),
             "prev_context": curr_prev_context.cpu(), "target_context": curr_target_context.cpu(),
-            "drift_state": current_drift.cpu()
+            "drift_state": current_drift.cpu(),
+            "ltm_memory_state": (
+                curr_fast_vals.cpu(),
+                curr_mom_vals.cpu(),
+                None,
+                None,
+                memory_timestamps.cpu() if isinstance(memory_timestamps, torch.Tensor) else memory_timestamps,
+                memory_sources.cpu() if isinstance(memory_sources, torch.Tensor) else memory_sources,
+            )
         }
 
 def load_quantized(model_path: str, device=None):

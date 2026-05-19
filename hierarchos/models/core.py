@@ -7,13 +7,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import numpy as np
 from typing import Optional
 from torch.utils.checkpoint import checkpoint
 
 from .rwkv_cell import RWKVCell
 from .ltm import LTMModule
 from ..utils.device import setup_msvc_environment, is_directml_device
-from ..utils.rosa import ROSA
+from ..utils.rosa import ROSA, rosa_async_pipeline, ROSAState
 
 class WorkerLoop:
     """
@@ -78,16 +79,18 @@ class WorkerLoop:
                 
                 drift_delta = torch.tanh(self.context_drift_proj(l_out))
                 current_drift = torch.clamp(current_drift + drift_delta, min=-5.0, max=5.0)
-                drift_sq = torch.sum(current_drift ** 2, dim=-1).mean()
+                drift_sq = torch.sum(current_drift ** 2, dim=-1)
                 hinge_cost = torch.relu(drift_sq - self.commitment_threshold)
                 hinge_cost = torch.clamp(hinge_cost, max=100.0)
                 drift_costs.append(hinge_cost)
                 
-                if torch.mean(torch.abs(drift_delta)) < self.l_conv_atol:
-                   break
+                # Update dynamic_context BEFORE convergence check (matches inference path)
                 dynamic_context = static_context + current_drift
                 l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
                 l_input = self.l_input_proj(l_input_vec)
+                
+                if torch.mean(torch.abs(drift_delta)) < self.l_conv_atol:
+                   break
 
         # Use original l_state (not shadow) for the actual state update
         ts = timestep if timestep is not None else 0
@@ -101,9 +104,9 @@ class WorkerLoop:
         next_l_state = torch.clamp(next_l_state, min=-50.0, max=50.0)
         
         final_enc = current_enc + self.l_to_out(final_l_out)
-        commitment_cost = torch.tensor(0.0, device=enc.device)
+        commitment_cost = torch.zeros(enc.shape[0], device=enc.device, dtype=enc.dtype)
         if len(drift_costs) > 0:
-            commitment_cost = torch.stack(drift_costs).mean()
+            commitment_cost = torch.stack(drift_costs, dim=0).mean(dim=0)
 
         return final_enc, next_l_state, commitment_cost, current_drift
 
@@ -132,11 +135,16 @@ class HierarchosCore(nn.Module):
         if self.use_deepembed:
             self.h_deepemb = nn.Embedding(config.vocab_size, config.h_hidden * 4)
             self.l_deepemb = nn.Embedding(config.vocab_size, config.l_hidden * 4)
+            nn.init.ones_(self.h_deepemb.weight)
+            nn.init.ones_(self.l_deepemb.weight)
         
         # V8 ROSA Embed - default to True
         self.use_rosa = getattr(config, 'use_rosa', True)
         if self.use_rosa:
             self.rosa_emb = nn.Embedding(config.vocab_size + 1, config.context_dim)
+            nn.init.zeros_(self.rosa_emb.weight)
+            # Learnable gate: sigmoid(-1.0) ≈ 0.27 initial injection strength
+            self.rosa_gate_logit = nn.Parameter(torch.tensor(-1.0))
         
         # Global Learnable State
         self.persistent_dim = getattr(config, 'persistent_dim', 128)
@@ -151,7 +159,13 @@ class HierarchosCore(nn.Module):
             key_dim=config.ltm_key_dim, 
             val_dim=config.ltm_val_dim,
             lr=getattr(config, 'ltm_lr', 1e-3),
-            forget_rate=getattr(config, 'ltm_forget_rate', 0.01)
+            momentum=getattr(config, 'ltm_momentum', 0.9),
+            wd=getattr(config, 'ltm_weight_decay', 1e-4),
+            forget_rate=getattr(config, 'ltm_forget_rate', 0.01),
+            reference_chunk_len=getattr(config, 'reference_chunk_len', getattr(config, 'training_chunk_size', 128)),
+            score_grad_scale=getattr(config, 'ltm_score_grad_scale', 1.0),
+            cpu_gather_retrieval=getattr(config, 'ltm_cpu_gather_retrieval', True),
+            cpu_sparse_update=getattr(config, 'ltm_cpu_sparse_update', True)
         )
         self.qproj = nn.Linear(config.context_dim * 2, config.ltm_key_dim, bias=False)
         self.val_proj = nn.Linear(config.context_dim, config.ltm_val_dim, bias=False)
@@ -168,6 +182,12 @@ class HierarchosCore(nn.Module):
         self.h_rnn = RWKVCell(config.h_hidden)
         self.h_to_context = nn.Linear(config.h_hidden, config.context_dim)
         self.h_halt_proj = nn.Linear(config.h_hidden, 1)
+        # Initialize bias to encourage max_h_steps pondering steps initially
+        # Formula: logit(1/N) = -log(N-1). This sets initial halt prob to 1/max_h_steps.
+        with torch.no_grad():
+            initial_steps = max(2.0, float(config.max_h_steps))
+            initial_bias = -math.log(initial_steps - 1.0)
+            self.h_halt_proj.bias.fill_(initial_bias)
         
         # Worker Components
         self.l_input_proj = nn.Linear(config.context_dim * 2, config.l_hidden)
@@ -253,41 +273,80 @@ class HierarchosCore(nn.Module):
         """
         B, T = input_ids.shape
         device = input_ids.device
+        allow_hebbian_update = kwargs.pop("allow_hebbian_update", False)
+        return_logits = kwargs.pop("return_logits", True)
+        return_topk_values = kwargs.pop("return_topk_values", True)
+        suppress_hebbian = kwargs.pop("suppress_hebbian", getattr(self, "suppress_hebbian", True))
+        if allow_hebbian_update:
+            suppress_hebbian = False
 
         x = self.tok_emb(input_ids)
 
-        # Unpack LTM Memory State early so we can use past_tokens
+        # Unpack LTM Memory State early so we can use past_tokens + ROSA states
+        rosa_states = None
+        memory_timestamps = None
+        memory_sources = None
         if ltm_memory_state is None:
-            curr_fast_vals = self.ltm.fast_vals
-            curr_mom_vals = self.ltm._mom_vals
+            isolate_batch_ltm = getattr(self.config, 'isolate_batch_ltm', True)
+            isolate_runtime_ltm = isolate_batch_ltm and (self.training or B > 1)
+            if isolate_runtime_ltm:
+                curr_fast_vals = self.ltm.fast_vals.unsqueeze(0).expand(B, -1, -1).clone()
+                curr_mom_vals = self.ltm._mom_vals.unsqueeze(0).expand(B, -1, -1).clone()
+                memory_timestamps = self.ltm.timestamps.unsqueeze(0).expand(B, -1).clone()
+                memory_sources = self.ltm.sources.unsqueeze(0).expand(B, -1).clone()
+            else:
+                curr_fast_vals = self.ltm.fast_vals
+                curr_mom_vals = self.ltm._mom_vals
+                memory_timestamps = self.ltm.timestamps
+                memory_sources = self.ltm.sources
             past_tokens = None
         else:
-            if len(ltm_memory_state) >= 3:
+            if len(ltm_memory_state) >= 6:
+                curr_fast_vals, curr_mom_vals, past_tokens, rosa_states, memory_timestamps, memory_sources = ltm_memory_state[:6]
+            elif len(ltm_memory_state) >= 4:
+                curr_fast_vals, curr_mom_vals, past_tokens, rosa_states = ltm_memory_state[:4]
+            elif len(ltm_memory_state) >= 3:
                 curr_fast_vals, curr_mom_vals, past_tokens = ltm_memory_state[:3]
             else:
                 curr_fast_vals, curr_mom_vals = ltm_memory_state
                 past_tokens = None
+            if memory_timestamps is None:
+                if curr_fast_vals.dim() == 3:
+                    memory_timestamps = self.ltm.timestamps.unsqueeze(0).expand(curr_fast_vals.shape[0], -1).clone()
+                    memory_sources = self.ltm.sources.unsqueeze(0).expand(curr_fast_vals.shape[0], -1).clone()
+                else:
+                    memory_timestamps = self.ltm.timestamps
+                    memory_sources = self.ltm.sources
 
         # V8 ROSA Precomputation (only when enabled)
+        new_rosa_states = None
         if self.use_rosa:
-            if past_tokens is not None:
-                full_input_ids = torch.cat([past_tokens, input_ids], dim=1)
-            else:
-                full_input_ids = input_ids
-                
-            input_ids_cpu = full_input_ids.cpu().tolist()
-            rosa_batch = []
-            for b in range(B):
-                y = ROSA(input_ids_cpu[b])
-                # Only take the ROSA outputs for the CURRENT input sequence
-                y_current = y[-T:]
-                y_current = [val if val != -1 else self.config.vocab_size for val in y_current]
-                rosa_batch.append(torch.tensor(y_current, device=device))
-            
-            rosa_batch_tensor = torch.stack(rosa_batch, dim=0)
+            rosa_max_ctx = getattr(self.config, 'rosa_max_context', 512)
+
+            # --- Datacenter-Optimized Async ROSA Pipeline ---
+            # Launch CPU suffix automaton work immediately (overlaps with GPU tok_emb)
+            # Uses: Numba JIT, parallel batch threads, pinned memory, CUDA streams,
+            #       and persistent automaton state across TBPTT chunks
+            rosa_finalize = rosa_async_pipeline(
+                input_ids=input_ids,
+                past_tokens=past_tokens,
+                rosa_states=rosa_states,
+                vocab_size=self.config.vocab_size,
+                device=device,
+                rosa_max_ctx=rosa_max_ctx,
+            )
+
+            # Finalize: wait for CPU work, async H2D transfer
+            rosa_batch_tensor, rosa_input, new_rosa_states = rosa_finalize()
+
             rosa_embs = self.rosa_emb(rosa_batch_tensor)
-            x = x + rosa_embs  # Neurosymbolic Inner Monologue Mix
-            new_past_tokens = full_input_ids
+            # Learnable injection gate (controls ROSA signal strength)
+            rosa_gate = torch.sigmoid(torch.clamp(self.rosa_gate_logit, min=-50.0, max=50.0))
+            x = x + rosa_gate * rosa_embs  # Gated Neurosymbolic Inner Monologue Mix
+
+            # Store past_tokens for cross-chunk continuity (capped by rosa_max_ctx)
+            # Detach and move to CPU immediately to prevent GPU memory leak across chunks
+            new_past_tokens = rosa_input.detach().cpu()
         else:
             new_past_tokens = None
 
@@ -322,12 +381,27 @@ class HierarchosCore(nn.Module):
             # Ensure they are on the correct device
             curr_fast_vals = curr_fast_vals.to(device)
             curr_mom_vals = curr_mom_vals.to(device)
+            memory_timestamps = memory_timestamps.to(device)
+            memory_sources = memory_sources.to(device)
+
+        drift_seed = None
+        if drift_state is not None:
+            drift_seed = drift_state.to(device)
+            if drift_seed.dim() == 1:
+                drift_seed = drift_seed.unsqueeze(0)
+            if drift_seed.shape[0] == 1 and B > 1:
+                drift_seed = drift_seed.expand(B, -1)
+            if drift_seed.shape != (B, self.config.context_dim):
+                drift_seed = None
 
         final_embs = []
         ponder_costs = []
+        ponder_weights = []
         commitment_costs = []
+        commitment_weights = []
         all_topk_vals = []
         all_topk_idx = []
+        aux_attention_mask = attention_mask.to(device=device, dtype=torch.float32) if attention_mask is not None else None
 
         stride = self.config.h_stride
         final_drift = None
@@ -346,10 +420,11 @@ class HierarchosCore(nn.Module):
             # --- LTM Retrieval ---
             p = self.persistent.unsqueeze(0).expand(B, -1)
             q_in = torch.cat([token_x, prev_context], dim=-1)
-            q = torch.clamp(self.qproj(q_in), min=-10, max=10)
+            q = torch.clamp(self.qproj(q_in), min=-12, max=12)
             
             topk_vals, topk_idx, topk_ts = self.ltm.retrieve_topk(
-                q, self.config.ltm_topk, min_timestamp, source_filter, fast_vals=curr_fast_vals
+                q, self.config.ltm_topk, min_timestamp, source_filter, fast_vals=curr_fast_vals,
+                timestamps=memory_timestamps, sources=memory_sources
             )
             
             all_topk_vals.append(topk_vals)
@@ -379,10 +454,10 @@ class HierarchosCore(nn.Module):
             h_out_real, h_state = self.h_rnn(enc_with_feedback, h_state, timestep=t, deepemb_vec=h_deepemb_vec)
             h_out_real = torch.clamp(h_out_real, min=-100.0, max=100.0)
             
-            if torch.isnan(h_out_real).any() or torch.isinf(h_out_real).any():
+            if getattr(self.config, 'debug_numerics', False) and (torch.isnan(h_out_real).any() or torch.isinf(h_out_real).any()):
                 print(f"WARNING: NaN/Inf detected in h_out_real at step {t}")
             
-            step_ponder_cost = torch.tensor(0.0, device=device)
+            step_ponder_cost = torch.zeros(B, device=device, dtype=enc.dtype)
             
             # PLANNING STEP (Strided with ACT)
             if abs_t % stride == 0:
@@ -404,8 +479,11 @@ class HierarchosCore(nn.Module):
                     h_step_outputs.append(h_out_ponder)
                     h_halt_probs.append(torch.sigmoid(halt_logit))
 
-                h_stack = torch.stack(h_step_outputs, dim=0)
-                halt_stack = torch.stack(h_halt_probs, dim=0)
+                # BUG #4 FIX: Force ACT weighting to float32 for numerical stability.
+                # BFloat16's limited precision (~7 bits) causes underflow in cumprod chains,
+                # leading to NaN weights. Mirrors the autocast(enabled=False) pattern in rwkv_cell.py.
+                h_stack = torch.stack(h_step_outputs, dim=0).float()
+                halt_stack = torch.stack(h_halt_probs, dim=0).float()
                 remain = 1.0 - halt_stack
                 remain_shifted = torch.cat([torch.ones_like(remain[:1]), remain[:-1]], dim=0)
                 cum_remain = torch.cumprod(remain_shifted, dim=0)
@@ -416,22 +494,29 @@ class HierarchosCore(nn.Module):
                 weights = weights / total.unsqueeze(0)
                 remainder = remainder / total
                 final_h_out = (weights.unsqueeze(-1) * h_stack).sum(dim=0) + remainder.unsqueeze(-1) * h_stack[-1]
+                final_h_out = final_h_out.to(enc.dtype)  # Cast back to working precision
                 
                 target_context = self.h_to_context(final_h_out)
                 target_context = torch.clamp(target_context, min=-50.0, max=50.0)
                 
-                step_ponder_cost = cum_remain.sum(dim=0).mean()
+                step_ponder_cost = cum_remain.sum(dim=0).to(enc.dtype)
                 ponder_costs.append(step_ponder_cost)
+                if aux_attention_mask is not None:
+                    ponder_weights.append(aux_attention_mask[:, t])
+                else:
+                    ponder_weights.append(torch.ones(B, device=device, dtype=torch.float32))
             
             # LERP (Interpolation)
             step_in_stride = abs_t % stride
             alpha = step_in_stride / float(stride)
-            sliding_context = torch.lerp(prev_context, target_context, alpha)
+            sliding_context = (prev_context.float() + alpha * (target_context.float() - prev_context.float())).to(prev_context.dtype)
 
             # ==================================================================
             # 4. WORKER STEP
             # ==================================================================
-            if self.context_drift_proj is not None:
+            if t == 0 and drift_seed is not None:
+                initial_drift = torch.clamp(drift_seed, min=-5.0, max=5.0)
+            elif self.context_drift_proj is not None:
                 prev_worker_h = l_state[:, :, 0].to(device)
                 initial_drift = torch.tanh(self.context_drift_proj(prev_worker_h))
                 initial_drift = torch.clamp(initial_drift, min=-5.0, max=5.0)
@@ -454,35 +539,31 @@ class HierarchosCore(nn.Module):
             
             final_embs.append(enc)
             commitment_costs.append(cc)
+            if aux_attention_mask is not None:
+                commitment_weights.append(aux_attention_mask[:, t])
+            else:
+                commitment_weights.append(torch.ones(B, device=device, dtype=torch.float32))
 
             # ==================================================================
-            # 5. MEMORY UPDATE (Differentiable Hebbian)
+            # 5. MEMORY UPDATE (Differentiable Hebbian — Inference Only)
             # ==================================================================
-            if self.training:
+            # During training, the trainer handles LTM updates via gradient-based
+            # Titans inner_update after backward(). Running Hebbian here too would
+            # cause double-decay and conflicting update signals on the same slots.
+            if not self.training and not suppress_hebbian:
                 val_to_store = self.val_proj(enc)
                 val_to_store = torch.clamp(val_to_store, min=-20.0, max=20.0)
                 val_expanded = val_to_store.unsqueeze(1).expand(-1, self.config.ltm_topk, -1)
                 
                 curr_fast_vals, curr_mom_vals = self.ltm.update_memory_hebbian(
                     topk_idx, None, val_expanded,
-                    current_lr=getattr(self.config, 'ltm_lr', 0.01),
-                    timestamp=float(abs_t),
-                    tokens_covered=1,
-                    fast_vals=curr_fast_vals,
-                    mom_vals=curr_mom_vals
-                )
-            else:
-                val_to_store = self.val_proj(enc)
-                val_to_store = torch.clamp(val_to_store, min=-20.0, max=20.0)
-                val_expanded = val_to_store.unsqueeze(1).expand(-1, self.config.ltm_topk, -1)
-                
-                curr_fast_vals, curr_mom_vals = self.ltm.update_memory_hebbian(
-                    topk_idx, None, val_expanded,
-                    current_lr=getattr(self.config, 'ltm_lr', 0.01),
+                    current_lr=getattr(self.config, 'ltm_lr', 0.001),  # COH #1: Use config LR, not hardcoded 0.01
                     timestamp=0.0,
                     tokens_covered=1,
                     fast_vals=curr_fast_vals,
                     mom_vals=curr_mom_vals,
+                    timestamps=memory_timestamps,
+                    sources=memory_sources,
                     inplace=True
                 )
 
@@ -490,55 +571,78 @@ class HierarchosCore(nn.Module):
         # 5. FINAL OUTPUTS
         # ==================================================================
         final = self.out_norm(torch.stack(final_embs, dim=1))
-        logits = self.lm_head(final)
-        
-        if torch.isnan(logits).any() or torch.isinf(logits).any():
-            print("WARNING: NaN/Inf detected in logits. Replacing with zeros and clamping...")
-            logits = torch.nan_to_num(logits, nan=0.0, posinf=30.0, neginf=-30.0)
-        
-        logits = torch.clamp(logits, min=-30.0, max=30.0)
+        logits = None
 
         loss = None
         ponder_cost_out = None
         commitment_cost_out = None
 
+        if labels is not None and not return_logits:
+            loss = self._compute_cuda_chunked_lm_loss(
+                final,
+                labels,
+                getattr(self.config, 'z_loss_weight', 1e-4),
+            )
+        else:
+            logits = self.lm_head(final)
+            
+            if getattr(self.config, 'debug_numerics', False) and (torch.isnan(logits).any() or torch.isinf(logits).any()):
+                print("WARNING: NaN/Inf detected in logits. Replacing with zeros and clamping...")
+                logits = torch.nan_to_num(logits, nan=0.0, posinf=30.0, neginf=-30.0)
+            
+            logits = torch.clamp(logits, min=-30.0, max=30.0)
+
+            if labels is not None:
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                
+                valid_mask = shift_labels != -100
+                if not valid_mask.any():
+                    loss = torch.tensor(0.0, device=device, requires_grad=True)
+                else:
+                    flat_logits = shift_logits.view(-1, self.config.vocab_size).float()
+                    flat_labels = shift_labels.view(-1)
+                    
+                    # Base CE Loss computes natively ignoring -100
+                    loss = F.cross_entropy(flat_logits, flat_labels)
+                    
+                    # Z-Loss Regularization built to prevent exploding logits
+                    z_loss_weight = getattr(self.config, 'z_loss_weight', 1e-4)
+                    if z_loss_weight > 0:
+                        # AMP FIX: Disable autocast for the z-loss block. Boolean indexing
+                        # (flat_logits[valid_mask_flat]) uses masked_scatter_ in its backward
+                        # pass. Under BFloat16 AMP, logsumexp can produce BF16 gradients that
+                        # flow back into the float32 flat_logits via masked_scatter_, crashing
+                        # with "expected self and source to have same dtypes".
+                        _zloss_device = device.type if device.type in ('cuda', 'cpu') else 'cpu'
+                        with torch.amp.autocast(device_type=_zloss_device, enabled=False):
+                            valid_mask_flat = flat_labels != -100
+                            valid_logits = flat_logits[valid_mask_flat]
+                            z_loss = torch.logsumexp(valid_logits, dim=-1).pow(2).mean() * z_loss_weight
+                        loss = loss + z_loss
+
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
             
-            valid_mask = shift_labels != -100
-            if not valid_mask.any():
-                loss = torch.tensor(0.0, device=device, requires_grad=True)
-            else:
-                flat_logits = shift_logits.view(-1, self.config.vocab_size).float()
-                flat_labels = shift_labels.view(-1)
-                
-                # Base CE Loss computes natively ignoring -100
-                loss = F.cross_entropy(flat_logits, flat_labels)
-                
-                # Z-Loss Regularization built to prevent exploding logits
-                z_loss_weight = getattr(self.config, 'z_loss_weight', 1e-4)
-                if z_loss_weight > 0:
-                    valid_mask_flat = flat_labels != -100
-                    valid_logits = flat_logits[valid_mask_flat]
-                    z_loss = torch.logsumexp(valid_logits, dim=-1).pow(2).mean() * z_loss_weight
-                    loss = loss + z_loss
-            
-            if ponder_costs: 
-                ponder_cost_out = torch.stack(ponder_costs).mean()
-                if self.training:
-                    loss = loss + ponder_cost_out * getattr(self.config, 'ponder_loss_weight', 0.01)
-            if commitment_costs: 
-                commitment_cost_out = torch.stack(commitment_costs).mean()
-                if self.training:
-                    loss = loss + commitment_cost_out * getattr(self.config, 'commitment_loss_weight', 0.05)
+            # Compute auxiliary costs for reporting (trainer handles loss composition)
+            def _weighted_aux_mean(costs, weights):
+                if not costs:
+                    return None
+                cost_tensor = torch.stack([c.float().view(B) for c in costs], dim=0)
+                weight_tensor = torch.stack(weights, dim=0).float()
+                denom = weight_tensor.sum()
+                if denom <= 0:
+                    return torch.zeros((), device=device, dtype=cost_tensor.dtype)
+                return (cost_tensor * weight_tensor).sum() / denom
+
+            ponder_cost_out = _weighted_aux_mean(ponder_costs, ponder_weights)
+            commitment_cost_out = _weighted_aux_mean(commitment_costs, commitment_weights)
 
         return {
             "loss": loss, 
             "logits": logits, 
             "ponder_cost": ponder_cost_out, 
             "commitment_cost": commitment_cost_out,
-            "topk_vals": torch.stack(all_topk_vals, dim=1) if all_topk_vals else None, 
+            "topk_vals": torch.stack(all_topk_vals, dim=1) if (return_topk_values and all_topk_vals) else None, 
             "raw_topk_vals": all_topk_vals,
             "topk_idx": torch.stack(all_topk_idx, dim=1) if all_topk_idx else None,
             "h_state": h_state,
@@ -546,17 +650,67 @@ class HierarchosCore(nn.Module):
             "prev_context": prev_context,
             "target_context": target_context,
             "drift_state": final_drift,
-            "ltm_memory_state": (curr_fast_vals, curr_mom_vals, new_past_tokens),
+            "ltm_memory_state": (curr_fast_vals, curr_mom_vals, new_past_tokens, new_rosa_states, memory_timestamps, memory_sources),
         }
+
+    def _compute_cuda_chunked_lm_loss(self, hidden: torch.Tensor, labels: torch.Tensor,
+                                      z_loss_weight: float = 1e-4) -> torch.Tensor:
+        """
+        Memory-friendly supervised-row loss path for large vocabularies.
+
+        This intentionally recomputes lm_head by row chunks instead of materializing
+        the full shifted logits tensor for loss calculation. The reduction matches
+        PyTorch's mean cross-entropy with ignore_index=-100, and the z-loss is
+        averaged over the same valid-token rows as the dense path.
+        """
+        shift_hidden = hidden[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        flat_hidden = shift_hidden.view(-1, hidden.shape[-1])
+        flat_labels = shift_labels.view(-1)
+
+        valid_mask = flat_labels != -100
+        valid_hidden = flat_hidden[valid_mask]
+        valid_labels = flat_labels[valid_mask]
+        valid_count = valid_labels.shape[0]
+        if valid_count == 0:
+            return hidden.sum() * 0.0
+        denom = torch.tensor(float(valid_count), device=hidden.device, dtype=torch.float32)
+
+        if hidden.device.type == "cpu":
+            chunk_rows = int(getattr(self.config, "cpu_loss_chunk_rows", 0) or 0)
+        else:
+            chunk_rows = int(getattr(self.config, "cuda_loss_chunk_rows", 0) or 0)
+        if chunk_rows <= 0:
+            chunk_rows = flat_hidden.shape[0]
+
+        total_ce = torch.zeros((), device=hidden.device, dtype=torch.float32)
+        total_z = torch.zeros((), device=hidden.device, dtype=torch.float32)
+
+        for start in range(0, valid_count, chunk_rows):
+            end = min(start + chunk_rows, valid_count)
+            chunk_hidden = valid_hidden[start:end]
+            chunk_labels = valid_labels[start:end]
+            chunk_logits = torch.clamp(self.lm_head(chunk_hidden), min=-30.0, max=30.0).float()
+
+            total_ce = total_ce + F.cross_entropy(chunk_logits, chunk_labels, reduction="sum")
+
+            if z_loss_weight > 0:
+                row_z = torch.logsumexp(chunk_logits, dim=-1).pow(2)
+                total_z = total_z + row_z.sum()
+
+        loss = total_ce / denom
+        if z_loss_weight > 0:
+            loss = loss + (total_z / denom) * z_loss_weight
+        return loss
 
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
         return {"input_ids": input_ids, **kwargs}
 
     def update_memory(self, topk_idx, grads, timestamp, lr=1e-3):
         """Updates the LTM memory using gradients (Titans style)."""
-        self.ltm.inner_update(topk_idx, grads, current_lr=lr, timestamp=timestamp)
+        self.ltm.inner_update(topk_idx, grads, current_lr=lr, timestamp=timestamp, inplace=True)
 
     def update_memory_hebbian(self, topk_idx, vals, timestamp, lr=1e-3, tokens_covered=1):
         """Updates the LTM memory using Hebbian rule (Fallback for Inference)."""
         self.ltm.update_memory_hebbian(topk_idx, None, vals, current_lr=lr, 
-                                       timestamp=timestamp, tokens_covered=tokens_covered)
+                                       timestamp=timestamp, tokens_covered=tokens_covered, inplace=True)

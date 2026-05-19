@@ -5,14 +5,14 @@ from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import time
 from tqdm import tqdm
-import math
 import sys
 import traceback
 import numpy as np
+import math
 
 from .optimizers import DirectMLAdamW
 from ..utils.device import is_directml_device, set_threads
-from ..utils.checkpoint import save_checkpoint_safely, load_full_model_with_config
+from ..utils.checkpoint import save_checkpoint_safely, load_full_model_with_config, sanitize_model_state_dict
 from ..models.core import HierarchosCore
 
 # Helper for AttrDict access
@@ -27,17 +27,188 @@ def validate_loss(loss: torch.Tensor, name: str = "loss") -> bool:
         return False
     return True
 
+def compute_chunk_training_weights(labels: torch.Tensor, attention_mask: torch.Tensor = None, chunk_size: int = 128):
+    """
+    Build TBPTT chunk weights that match the causal objective.
+
+    CrossEntropy is averaged over valid shifted labels inside each chunk, so the
+    trainer must weight chunk CE by the number of supervised answer tokens, not
+    by raw chunk count or total padded length. Auxiliary costs are token-level
+    dynamics, so they use real attention-mask tokens instead.
+    """
+    B, T = labels.shape
+    if chunk_size <= 0 or chunk_size > T:
+        chunk_size = T
+
+    chunks = []
+    total_valid_predictions = 0
+    total_real_tokens = 0
+
+    for start_t in range(0, T, chunk_size):
+        end_t = min(start_t + chunk_size, T)
+        chunk_labels = labels[:, start_t:end_t]
+
+        if chunk_labels.shape[1] > 1:
+            valid_predictions = int((chunk_labels[:, 1:] != -100).sum().item())
+        else:
+            valid_predictions = 0
+
+        if attention_mask is not None:
+            real_tokens = int(attention_mask[:, start_t:end_t].sum().item())
+        else:
+            real_tokens = B * (end_t - start_t)
+
+        chunks.append({
+            "start": start_t,
+            "end": end_t,
+            "valid_predictions": valid_predictions,
+            "real_tokens": real_tokens,
+        })
+        total_valid_predictions += valid_predictions
+        total_real_tokens += real_tokens
+
+    for chunk in chunks:
+        chunk["label_ratio"] = (
+            chunk["valid_predictions"] / float(total_valid_predictions)
+            if total_valid_predictions > 0 else 0.0
+        )
+        chunk["token_ratio"] = (
+            chunk["real_tokens"] / float(total_real_tokens)
+            if total_real_tokens > 0 else 0.0
+        )
+
+    return chunks
+
+def compute_remaining_update_steps(dataloader_len: int, accumulation_steps: int, start_epoch: int,
+                                   total_epochs: int, start_step: int = 0) -> int:
+    """Count optimizer updates that will actually run after an epoch/mid-epoch resume."""
+    accumulation_steps = max(1, int(accumulation_steps))
+    remaining_epochs_after_current = max(0, int(total_epochs) - int(start_epoch) - 1)
+    remaining_batches = max(0, int(dataloader_len) - int(start_step))
+    remaining_batches += remaining_epochs_after_current * int(dataloader_len)
+    return max(1, remaining_batches // accumulation_steps)
+
+def estimate_cuda_loss_chunk_rows(free_bytes: int, batch_size: int, chunk_size: int,
+                                  vocab_size: int, requested_rows: int = 0) -> int:
+    """
+    Pick a CUDA lm_head loss chunk size from live free VRAM and current batch shape.
+
+    On 96GB-class GPUs this targets 16834 rows by default, which is large enough
+    to cover batch sizes around 132 at a 128-token TBPTT chunk in one loss pass.
+    """
+    requested_rows = int(requested_rows or 0)
+    if requested_rows > 0:
+        return requested_rows
+
+    free_bytes = max(0, int(free_bytes or 0))
+    batch_size = max(1, int(batch_size or 1))
+    chunk_size = max(1, int(chunk_size or 1))
+    vocab_size = max(1, int(vocab_size or 1))
+
+    free_gb = free_bytes / float(1024 ** 3)
+    if free_gb >= 72.0:
+        base_rows = 16834
+    elif free_gb >= 48.0:
+        base_rows = 12288
+    elif free_gb >= 24.0:
+        base_rows = 8192
+    elif free_gb >= 12.0:
+        base_rows = 4096
+    else:
+        base_rows = 2048
+
+    batch_rows = batch_size * max(1, chunk_size - 1)
+    batch_target_rows = int(math.ceil(batch_rows * 1.05))
+
+    # FP32 logits dominate; reserve room for backward/temp buffers and leave most
+    # free VRAM for activations, optimizer state, CUDA graphs, and fragmentation.
+    estimated_bytes_per_row = vocab_size * 4 * 3
+    memory_budget = max(512 * 1024 ** 2, int(free_bytes * 0.20))
+    memory_cap_rows = max(512, memory_budget // max(1, estimated_bytes_per_row))
+
+    rows = max(base_rows, min(batch_target_rows, memory_cap_rows))
+    rows = min(rows, memory_cap_rows)
+    return max(512, int(rows))
+
+def tune_cuda_loss_chunk_rows_once(model, args, batch_size: int, chunk_size: int):
+    """Auto-tune CUDA loss chunking once after startup/model allocation."""
+    if not (torch.cuda.is_available() and getattr(args, 'cuda_chunked_lm_loss', True)):
+        return
+    if not getattr(args, '_auto_cuda_loss_chunk_rows', False):
+        return
+
+    device = next(model.parameters()).device
+    if device.type != 'cuda':
+        return
+
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    vocab_size = int(getattr(model.config, 'vocab_size', getattr(args, 'vocab_size', 1)))
+    rows = estimate_cuda_loss_chunk_rows(
+        free_bytes=free_bytes,
+        batch_size=batch_size,
+        chunk_size=chunk_size,
+        vocab_size=vocab_size,
+    )
+
+    previous = int(getattr(args, 'cuda_loss_chunk_rows', 0) or 0)
+    if rows != previous:
+        args.cuda_loss_chunk_rows = rows
+        if hasattr(model, 'config'):
+            model.config.cuda_loss_chunk_rows = rows
+        free_gb = free_bytes / (1024 ** 3)
+        total_gb = total_bytes / (1024 ** 3)
+        print(
+            f"INFO: Startup CUDA loss chunk rows set to {rows} "
+            f"(free VRAM {free_gb:.1f}/{total_gb:.1f} GB, batch={batch_size}, chunk={chunk_size})."
+        )
+
+def trim_trailing_padding(input_ids: torch.Tensor, labels: torch.Tensor, attention_mask: torch.Tensor = None):
+    """Remove trailing columns that are padding for the entire batch."""
+    if attention_mask is None:
+        return input_ids, labels, attention_mask
+    if not isinstance(attention_mask, torch.Tensor):
+        return input_ids, labels, attention_mask
+    if input_ids.ndim != 2 or labels.ndim != 2 or attention_mask.ndim != 2:
+        return input_ids, labels, attention_mask
+    if attention_mask.shape[1] != input_ids.shape[1] or labels.shape[1] != input_ids.shape[1]:
+        return input_ids, labels, attention_mask
+
+    active_columns = attention_mask.bool().any(dim=0)
+    if not bool(active_columns.any().item()):
+        return input_ids, labels, attention_mask
+    trim_to = int(active_columns.nonzero(as_tuple=False)[-1].item()) + 1
+    if trim_to >= input_ids.shape[1]:
+        return input_ids, labels, attention_mask
+    return (
+        input_ids[:, :trim_to].contiguous(),
+        labels[:, :trim_to].contiguous(),
+        attention_mask[:, :trim_to].contiguous(),
+    )
+
+def set_dataloader_epoch(dataloader, epoch: int):
+    """Let length-grouped or distributed samplers reshuffle per epoch."""
+    for sampler in (
+        getattr(dataloader, "batch_sampler", None),
+        getattr(dataloader, "sampler", None),
+        getattr(dataloader, "dataset", None),
+    ):
+        set_epoch = getattr(sampler, "set_epoch", None)
+        if callable(set_epoch):
+            set_epoch(epoch)
+
 def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, running_states):
     """Training step with temporal chunking to match original hierarchos.py."""
     device = next(model.parameters()).device
     _nb = (device.type == 'cuda')  # non_blocking for async CUDA transfer
-    full_input_ids = batch['input_ids'].to(device, non_blocking=_nb)
+    full_input_ids = batch['input_ids']
     full_attention_mask = batch.get('attention_mask')
-    if full_attention_mask is not None: full_attention_mask = full_attention_mask.to(device, non_blocking=_nb)
-    full_labels = batch['labels'].to(device, non_blocking=_nb)
+    full_labels = batch['labels']
+    full_input_ids, full_labels, full_attention_mask = trim_trailing_padding(
+        full_input_ids, full_labels, full_attention_mask
+    )
     
     # --- [NEW] Track Sequence Poisoning (Parity Fix) ---
-    if torch.isnan(full_labels.float()).any():
+    if full_labels.is_floating_point() and torch.isnan(full_labels).any():
         print(f"\nCRITICAL: NaNs detected in labels at step {step}! Skipping batch.")
         optimizer.zero_grad(set_to_none=True)
         return None, running_states
@@ -81,21 +252,41 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
         if ltm_state is not None: 
             ltm_state = tuple(s.detach() if isinstance(s, torch.Tensor) else s for s in ltm_state)
     
-    # Temporal chunking (critical for RWKV-based models)
+    # Temporal chunking (critical for RWKV-based models). Build this on CPU before
+    # moving labels/masks to CUDA so per-chunk .item() accounting does not sync GPU.
     chunk_size = getattr(args, 'training_chunk_size', 128)
     if chunk_size <= 0 or chunk_size > T: chunk_size = T
-    num_chunks = math.ceil(T / chunk_size)
+    chunk_plan = compute_chunk_training_weights(full_labels, full_attention_mask, chunk_size)
+    num_chunks = len(chunk_plan)
+
+    full_input_ids = full_input_ids.to(device, non_blocking=_nb)
+    if full_attention_mask is not None: full_attention_mask = full_attention_mask.to(device, non_blocking=_nb)
+    full_labels = full_labels.to(device, non_blocking=_nb)
     
-    total_loss = 0.0
-    total_ponder = 0.0
-    total_commit = 0.0
+    total_loss = torch.zeros((), device=device, dtype=torch.float32)
+    total_ponder = torch.zeros((), device=device, dtype=torch.float32)
+    total_commit = torch.zeros((), device=device, dtype=torch.float32)
+    has_ponder = False
+    has_commitment = False
     chunks_processed = 0
     final_outputs = None
+    fast_lm_loss = (
+        (device.type == 'cuda' and getattr(args, 'cuda_chunked_lm_loss', True))
+        or (device.type == 'cpu' and getattr(args, 'cpu_chunked_lm_loss', True))
+    )
     
     try:
-        for chunk_idx in range(num_chunks):
-            start_t = chunk_idx * chunk_size
-            end_t = min((chunk_idx + 1) * chunk_size, T)
+        for chunk_idx, chunk_info in enumerate(chunk_plan):
+            start_t = chunk_info["start"]
+            end_t = chunk_info["end"]
+            label_ratio = chunk_info["label_ratio"]
+            token_ratio = chunk_info["token_ratio"]
+
+            # Dynamic padding can create trailing chunks with no real tokens and
+            # no supervised labels. Skip them entirely so padding cannot decay or
+            # momentum-step LTM state through a zero-gradient update.
+            if label_ratio == 0.0 and token_ratio == 0.0:
+                continue
             
             # Slice tensors for this chunk
             input_ids = full_input_ids[:, start_t:end_t]
@@ -107,20 +298,24 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     input_ids=input_ids, attention_mask=attention_mask, labels=labels,
                     h_state=h_state, l_state=l_state, prev_context=prev_ctx,
                     target_context=target_ctx, drift_state=drift_state, ltm_memory_state=ltm_state,
-                    global_pos_offset=start_t
+                    global_pos_offset=start_t,
+                    return_logits=not fast_lm_loss,
+                    return_topk_values=False
                 )
                 
-                # --- [NEW] Titans Memory Gradient-Based Update (Parity Fix) ---
+                # LTM fast-memory update needs gradients from the exact tensors used
+                # by the forward graph. retrieve_topk already keeps them float32.
                 if outputs.get("raw_topk_vals") is not None:
                     for t_val in outputs["raw_topk_vals"]:
-                        if t_val.requires_grad: t_val.retain_grad()
-                # -------------------------------------------------------------
+                        if t_val.requires_grad:
+                            t_val.retain_grad()
+
 
                 ce_loss = outputs['loss']
                 ponder_cost = outputs.get('ponder_cost')
                 commitment_cost = outputs.get('commitment_cost')
                 
-                combined_loss = ce_loss
+                aux_loss = torch.zeros_like(ce_loss)
                 
                 # --- ACT Sensitivity: Adaptive Ponder Loss ---
                 if ponder_cost is not None:
@@ -129,7 +324,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     if getattr(args, 'encourage_thinking', False):
                         # RECOVERY MODE: Invert ponder penalty to REWARD thinking
                         # Negative weight means higher ponder = lower loss
-                        combined_loss = combined_loss - (abs(ponder_weight) * ponder_cost)
+                        aux_loss = aux_loss - (abs(ponder_weight) * ponder_cost)
                     elif getattr(args, 'adaptive_ponder', False):
                         # ADAPTIVE MODE: Scale ponder target with loss
                         # Higher CE loss = more thinking needed
@@ -139,28 +334,21 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                         ponder_diff = target_ponder - ponder_cost
                         # Penalize under-thinking (when ponder < target), ignore over-thinking
                         ponder_penalty = torch.relu(ponder_diff) * ponder_weight
-                        combined_loss = combined_loss + ponder_penalty
+                        aux_loss = aux_loss + ponder_penalty
                     else:
                         # STANDARD MODE: Original additive penalty (penalizes thinking)
-                        combined_loss = combined_loss + (ponder_weight * ponder_cost)
+                        aux_loss = aux_loss + (ponder_weight * ponder_cost)
                 
                 if commitment_cost is not None:
-                    combined_loss = combined_loss + (getattr(args, 'commitment_loss_weight', 0.5) * commitment_cost)
+                    aux_loss = aux_loss + (getattr(args, 'commitment_loss_weight', 0.5) * commitment_cost)
 
-                # --- FLAT WEIGHTING (Parity with Monolith) ---
-                # The monolith does not weight chunks by length. 
-                # We use unweighted loss to ensure gradient parity.
-                chunk_loss = combined_loss / accumulation_steps
-
-                # We still need chunk_ratio (relative to T) for sequence-averaged display metrics
-                chunk_len = (end_t - start_t)
-                chunk_ratio = chunk_len / float(T)
+                # CE is already averaged over valid labels within this chunk.
+                # Weight it by supervised answer-token count so long masked
+                # prompts/tool traces do not dilute the actual learning signal.
+                chunk_loss = ((ce_loss * label_ratio) + (aux_loss * token_ratio)) / accumulation_steps
             
             # Backprop per chunk (TBPTT)
-            # Prepare for LTM gradient extraction
-            if outputs.get("raw_topk_vals") is not None:
-                for t_val in outputs["raw_topk_vals"]:
-                    if t_val.requires_grad: t_val.retain_grad()
+            # retain_grad() is now handled inside autocast block above (BUG #1 fix)
 
             if scaler is not None: scaler.scale(chunk_loss).backward()
             else: chunk_loss.backward()
@@ -185,30 +373,66 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     # Clear intermediate grads immediately to free memory
                     for t_val in outputs["raw_topk_vals"]:
                         t_val.grad = None
+                    outputs["raw_topk_vals"] = None  # Free tensor references (BUG #3: memory leak fix)
+                    ltm_grads_tensor = torch.nan_to_num(ltm_grads_tensor, nan=0.0, posinf=0.0, neginf=0.0)
 
-                    if torch.isfinite(ltm_grads_tensor).all():
-                        if getattr(args, 'grad_clip', 1.0) > 0:
-                            torch.nn.utils.clip_grad_norm_([ltm_grads_tensor], getattr(args, 'grad_clip', 1.0))
+                    if ltm_grads_tensor is not None:
+                        # Direct tensor clipping (clip_grad_norm_ expects parameters with .grad,
+                        # but ltm_grads_tensor IS the gradient data itself — no .grad attribute)
+                        _clip_val = getattr(args, 'grad_clip', 1.0)
+                        if _clip_val > 0:
+                            _grad_norm = ltm_grads_tensor.norm()
+                            _clip_coef = torch.clamp(
+                                ltm_grads_tensor.new_tensor(float(_clip_val)) / (_grad_norm + 1e-8),
+                                max=1.0,
+                            )
+                            ltm_grads_tensor = ltm_grads_tensor * _clip_coef
+                        
+                        # Unpack current LTM state for the update
+                        curr_ltm = outputs.get('ltm_memory_state')
+                        curr_fast = curr_ltm[0] if curr_ltm is not None else None
+                        curr_mom = curr_ltm[1] if curr_ltm is not None else None
+                        curr_past_tokens = curr_ltm[2] if curr_ltm is not None and len(curr_ltm) >= 3 else None
+                        curr_rosa_states = curr_ltm[3] if curr_ltm is not None and len(curr_ltm) >= 4 else None
+                        curr_timestamps = curr_ltm[4] if curr_ltm is not None and len(curr_ltm) >= 5 else None
+                        curr_sources = curr_ltm[5] if curr_ltm is not None and len(curr_ltm) >= 6 else None
                         
                         # Titans inner_update (Gradient-based)
-                        # [PARITY FIX] We do NOT pass hebbian_fast/mom here to match 
-                        # the monolith's behavior during training.
+                        # Pass fast_vals/mom_vals from forward pass state, not module defaults
                         new_fast, new_mom = model.ltm.inner_update(
                             outputs["topk_idx"],
                             ltm_grads_tensor,
-                            current_lr=getattr(args, 'ltm_lr', 0.001), # Default 1e-3
+                            current_lr=getattr(args, 'ltm_lr', 0.001),
                             source=2, # SRC_TRAINING_DATA
                             timestamp=float(end_t),
                             tokens_covered=end_t - start_t,
+                            fast_vals=curr_fast,
+                            mom_vals=curr_mom,
+                            timestamps=curr_timestamps,
+                            sources=curr_sources,
                             inplace=True
                         )
-                        ltm_state = (new_fast.detach(), new_mom.detach())
+                        ltm_state = (new_fast.detach(), new_mom.detach(), 
+                                     curr_past_tokens.detach() if curr_past_tokens is not None else None,
+                                     curr_rosa_states,
+                                     curr_timestamps.detach() if isinstance(curr_timestamps, torch.Tensor) else curr_timestamps,
+                                     curr_sources.detach() if isinstance(curr_sources, torch.Tensor) else curr_sources)  # ROSA automaton states (plain Python, no detach needed)
                     else:
-                        ltm_state = (outputs['ltm_memory_state'][0].detach(), outputs['ltm_memory_state'][1].detach())
+                        curr_ltm = outputs['ltm_memory_state']
+                        ltm_state = (curr_ltm[0].detach(), curr_ltm[1].detach(),
+                                     curr_ltm[2].detach() if len(curr_ltm) >= 3 and curr_ltm[2] is not None else None,
+                                     curr_ltm[3] if len(curr_ltm) >= 4 else None,
+                                     curr_ltm[4].detach() if len(curr_ltm) >= 5 and isinstance(curr_ltm[4], torch.Tensor) else None,
+                                     curr_ltm[5].detach() if len(curr_ltm) >= 6 and isinstance(curr_ltm[5], torch.Tensor) else None)
             else:
                 # No LTM outputs? Just take what we have
                 if outputs.get('ltm_memory_state') is not None:
-                    ltm_state = (outputs['ltm_memory_state'][0].detach(), outputs['ltm_memory_state'][1].detach())
+                    curr_ltm = outputs['ltm_memory_state']
+                    ltm_state = (curr_ltm[0].detach(), curr_ltm[1].detach(),
+                                 curr_ltm[2].detach() if len(curr_ltm) >= 3 and curr_ltm[2] is not None else None,
+                                 curr_ltm[3] if len(curr_ltm) >= 4 else None,
+                                 curr_ltm[4].detach() if len(curr_ltm) >= 5 and isinstance(curr_ltm[4], torch.Tensor) else None,
+                                 curr_ltm[5].detach() if len(curr_ltm) >= 6 and isinstance(curr_ltm[5], torch.Tensor) else None)
 
             # Update states for next chunk (TBPTT - detach to limit gradient flow)
             if outputs.get('h_state') is not None:
@@ -223,11 +447,13 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                 drift_state = torch.clamp(outputs['drift_state'].detach(), min=-5.0, max=5.0)
             
             # Accumulate for display
-            total_loss += ce_loss.item() * chunk_ratio
+            total_loss = total_loss + ce_loss.detach().float() * label_ratio
             if ponder_cost is not None: 
-                total_ponder += ponder_cost.item() * chunk_ratio
+                total_ponder = total_ponder + ponder_cost.detach().float() * token_ratio
+                has_ponder = True
             if commitment_cost is not None: 
-                total_commit += commitment_cost.item() * chunk_ratio
+                total_commit = total_commit + commitment_cost.detach().float() * token_ratio
+                has_commitment = True
             
             chunks_processed += 1
             # final_outputs = outputs # REMOVED: Memory Leak Fix
@@ -250,9 +476,9 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
         # Return averaged metrics for display
         # Since we already weighted by chunk_ratio, these are correct averages
         avg_outputs = {
-            'loss': torch.tensor(total_loss),
-            'ponder_cost': torch.tensor(total_ponder) if total_ponder > 0 else None,
-            'commitment_cost': torch.tensor(total_commit) if total_commit > 0 else None,
+            'loss': total_loss.detach().cpu(),
+            'ponder_cost': total_ponder.detach().cpu() if has_ponder else None,
+            'commitment_cost': total_commit.detach().cpu() if has_commitment else None,
         }
         
         next_states = (h_state, l_state, prev_ctx, target_ctx, drift_state, ltm_state)
@@ -268,6 +494,11 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
 
 def train(args, device, tokenizer, dataloader, dataloader_len):
     print("Running in TRAIN mode...")
+    if dataloader_len <= 0:
+        print("ERROR: dataloader_len must be > 0. If automatic detection failed, please specify --dataset-size.")
+        return
+    
+    
     if getattr(args, 'out_dir', None):
         os.makedirs(args.out_dir, exist_ok=True)
     config = AttrDict(vars(args))
@@ -288,7 +519,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     # =================================================================
     if device.type == 'cuda':
         gpu_name = torch.cuda.get_device_name(device)
-        gpu_mem = torch.cuda.get_device_properties(device).total_mem / (1024**3)
+        gpu_mem = torch.cuda.get_device_properties(device).total_memory / (1024**3)
         gpu_capability = torch.cuda.get_device_capability(device)
         print(f"INFO: CUDA GPU: {gpu_name} ({gpu_mem:.1f} GB, SM {gpu_capability[0]}.{gpu_capability[1]})")
 
@@ -296,13 +527,16 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         if gpu_capability[0] >= 8:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision('high')  # OPT #4: Canonical TF32 API
             print("INFO: TF32 matmul enabled (Ampere+ GPU detected).")
 
         # cuDNN benchmark — auto-tunes convolution algorithms for the hardware
         torch.backends.cudnn.benchmark = True
 
-        # Auto-enable AMP on CUDA if not explicitly disabled
-        if not getattr(args, 'amp', False):
+        # Auto-enable AMP on CUDA unless the user explicitly passed --amp or --no-amp.
+        # Must check all argparse-accepted forms (hyphen and underscore variants).
+        _amp_was_explicitly_set = any(a in sys.argv for a in ('--amp', '--no-amp', '--no_amp'))
+        if not _amp_was_explicitly_set:
             args.amp = True
             config.amp = True
             print("INFO: AMP auto-enabled for CUDA training (use --no-amp to disable).")
@@ -315,11 +549,29 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
 
         # Prefer bfloat16 on Ampere+ for better dynamic range (no GradScaler needed)
         if gpu_capability[0] >= 8 and torch.cuda.is_bf16_supported():
+            args.amp_dtype = 'bfloat16'
             config.amp_dtype = 'bfloat16'
             print("INFO: Using bfloat16 AMP (Ampere+ native support).")
         else:
+            args.amp_dtype = 'float16'
             config.amp_dtype = 'float16'
             print("INFO: Using float16 AMP with GradScaler.")
+
+        if getattr(args, 'cuda_chunked_lm_loss', True):
+            loss_chunk_rows = int(getattr(args, 'cuda_loss_chunk_rows', 0) or 0)
+            if loss_chunk_rows <= 0:
+                args._auto_cuda_loss_chunk_rows = True
+                config.cuda_loss_chunk_rows = 0
+                print("INFO: CUDA chunked LM loss enabled (startup auto rows from free VRAM and batch shape).")
+            else:
+                args._auto_cuda_loss_chunk_rows = False
+                config.cuda_loss_chunk_rows = loss_chunk_rows
+                print(f"INFO: CUDA chunked LM loss enabled ({loss_chunk_rows} fixed rows/chunk, logits omitted in train_step).")
+            config.cuda_loss_chunk_rows = loss_chunk_rows
+            config.cuda_chunked_lm_loss = True
+        else:
+            args._auto_cuda_loss_chunk_rows = False
+            config.cuda_chunked_lm_loss = False
 
         # Multi-GPU info
         num_gpus = torch.cuda.device_count()
@@ -333,6 +585,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     scaler = None
     scheduler = None
     checkpoint = None
+    # NOTE: use_amp MUST be read AFTER the CUDA block above, which may auto-enable AMP.
     use_amp = getattr(args, 'amp', False)
     
     # 1. Loading/Resuming Logic
@@ -342,7 +595,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         
         saved_config = checkpoint.get('config', {})
         model_config = AttrDict(saved_config)
-        state_dict = checkpoint['model_state_dict']
+        state_dict = sanitize_model_state_dict(checkpoint['model_state_dict'], reset_transient_ltm=False)
         
         # ARCH Detection (Safely handling compiled checkpoints with '_orig_mod.' prefix)
         state_dict_keys = set()
@@ -426,6 +679,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                     print("WARNING: h_halt_proj.bias not found, surgical fix skipped.")
         
         if is_directml_device(device): optimizer = DirectMLAdamW(model.parameters(), lr=args.starting_lr)
+        elif device.type == 'cuda': optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr, fused=True)
         else: optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr)
         
         if not getattr(args, 'override_scheduling', False) and 'optimizer_state_dict' in checkpoint:
@@ -435,7 +689,9 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         # Original script uses 'completed_epoch', modular uses 'epoch', check both for compatibility
         start_epoch = checkpoint.get('completed_epoch', checkpoint.get('epoch', 0))
         print(f"Successfully loaded model state. Resuming from epoch {start_epoch + 1}.")
-        if use_amp and getattr(config, 'amp_dtype', 'float16') != 'bfloat16':
+        # BFloat16 does NOT use GradScaler — its dynamic range makes scaling unnecessary.
+        # Only create scaler for float16 AMP.
+        if use_amp and getattr(config, 'amp_dtype', 'float16') == 'float16':
             scaler = GradScaler()
             if 'scaler_state_dict' in checkpoint and not getattr(args, 'override_scheduling', False):
                 try: scaler.load_state_dict(checkpoint['scaler_state_dict'])
@@ -448,17 +704,19 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         model.config = model_config
         
         if is_directml_device(device): optimizer = DirectMLAdamW(model.parameters(), lr=args.starting_lr)
+        elif device.type == 'cuda': optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr, fused=True)
         else: optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr)
         
-        if use_amp and getattr(config, 'amp_dtype', 'float16') != 'bfloat16': scaler = GradScaler()
+        if use_amp and getattr(config, 'amp_dtype', 'float16') == 'float16': scaler = GradScaler()
     
     else:
         print("Starting training from scratch.")
         if 'vocab_size' not in config: config.vocab_size = len(tokenizer)
         model = HierarchosCore(config).to(device)
         if is_directml_device(device): optimizer = DirectMLAdamW(model.parameters(), lr=args.starting_lr)
+        elif device.type == 'cuda': optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr, fused=True)
         else: optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr)
-        if use_amp and getattr(config, 'amp_dtype', 'float16') != 'bfloat16': scaler = GradScaler()
+        if use_amp and getattr(config, 'amp_dtype', 'float16') == 'float16': scaler = GradScaler()
 
     # --- [NEW] Sync LTM reference chunk size (Parity Fix) ---
     training_chunk_size = getattr(args, 'training_chunk_size', 128)
@@ -469,6 +727,11 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         if model.ltm.reference_chunk_len != training_chunk_size:
             print(f"INFO: Updating LTM reference chunk length from {model.ltm.reference_chunk_len} to {training_chunk_size}")
             model.ltm.reference_chunk_len = training_chunk_size
+        model.ltm.cpu_gather_retrieval = bool(getattr(args, 'ltm_cpu_gather_retrieval', True))
+        model.ltm.cpu_sparse_update = bool(getattr(args, 'ltm_cpu_sparse_update', True))
+    if hasattr(model, 'config'):
+        model.config.cpu_chunked_lm_loss = bool(getattr(args, 'cpu_chunked_lm_loss', True))
+        model.config.cpu_loss_chunk_rows = int(getattr(args, 'cpu_loss_chunk_rows', 0) or 0)
     # ----------------------------------------------------
 
     # --- Print Model Stats ---
@@ -486,14 +749,27 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
 
     # Compile
     model.compile()
+    tune_cuda_loss_chunk_rows_once(
+        model,
+        args,
+        batch_size=getattr(args, 'batch_size', 1),
+        chunk_size=getattr(args, 'training_chunk_size', 128),
+    )
+
+    start_step = checkpoint.get('mid_epoch_step', 0) if checkpoint else 0
 
     # Scheduler
     # When override_scheduling is used during resume, calculate T_max based on REMAINING epochs
     # so that the LR decays properly to min_lr by the final epoch.
     if getattr(args, 'override_scheduling', False) and args.resume_from_ckpt:
-        remaining_epochs = args.epochs - start_epoch
-        num_update_steps = (dataloader_len // args.accumulation_steps) * remaining_epochs
-        print(f"INFO: --override-scheduling: Calculating LR schedule for REMAINING {remaining_epochs} epochs ({num_update_steps} update steps)")
+        num_update_steps = compute_remaining_update_steps(
+            dataloader_len,
+            args.accumulation_steps,
+            start_epoch,
+            args.epochs,
+            start_step,
+        )
+        print(f"INFO: --override-scheduling: Calculating LR schedule for remaining work ({num_update_steps} update steps)")
     else:
         num_update_steps = (dataloader_len // args.accumulation_steps) * args.epochs
     
@@ -502,8 +778,6 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         if args.resume_from_ckpt and not getattr(args, 'override_scheduling', False) and 'scheduler_state_dict' in checkpoint:
             try: scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             except: pass
-    start_step = checkpoint.get('mid_epoch_step', 0) if checkpoint else 0
-    
     # --- Evaluation Confirmation ---
     eval_tasks = getattr(args, 'eval_tasks', None)
     if eval_tasks:
@@ -513,14 +787,34 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     # --- Training Loop ---
     for epoch in range(start_epoch, args.epochs):
         model.train()
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
-        running_states = (None, None, None, None, None, None)
+        set_dataloader_epoch(dataloader, epoch)
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}", total=dataloader_len)
+        
+        # [NEW] Restore running_states if resuming mid-epoch
+        if epoch == start_epoch and checkpoint and 'running_states' in checkpoint:
+            _raw_states = checkpoint['running_states']
+            # Ensure tensors are on the correct device
+            running_states = []
+            for s in _raw_states:
+                if isinstance(s, torch.Tensor):
+                    running_states.append(s.to(device))
+                elif isinstance(s, tuple):
+                    running_states.append(tuple(ss.to(device) if isinstance(ss, torch.Tensor) else ss for ss in s))
+                else:
+                    running_states.append(s)
+            running_states = tuple(running_states)
+            print(f"INFO: Restored RNN/LTM running states from checkpoint on {device}.")
+        else:
+            running_states = (None, None, None, None, None, None)
         
         for step, batch in enumerate(pbar):
             # Mid-Epoch Resumption: Skip steps already processed
             if epoch == start_epoch and step < start_step:
                 if step == start_step - 1: # Print only once when we are about to start processing
                     print(f"INFO: Resuming from mid-epoch step {start_step}...")
+                continue
+
+            if batch is None:
                 continue
             
             # --- FIXED: Sequence-Level State Reset ---
@@ -549,11 +843,12 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                 save_checkpoint_safely({
                     'completed_epoch': epoch, # Not yet completed
                     'mid_epoch_step': step + 1,
-                    'model_state_dict': model.state_dict(),
+                    'model_state_dict': sanitize_model_state_dict(model),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
                     'scaler_state_dict': scaler.state_dict() if scaler else None,
                     'config': dict(model.config),
+                    'running_states': running_states, # [NEW] Persist states for graceful resumption
                 }, os.path.join(args.out_dir, f"hierarchos_epoch_{epoch+1}_step_{step+1}.pt"))
             
             # --- STEP-BASED EVALUATION (runs every N steps) ---
@@ -592,7 +887,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         
         save_checkpoint_safely({
             'completed_epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': sanitize_model_state_dict(model),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
             'scaler_state_dict': scaler.state_dict() if scaler else None,
@@ -649,10 +944,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     print(f"Saving final inference model to: {final_model_path}")
     
     # Clean state dict (remove _orig_mod. prefix from compiled models)
-    clean_state_dict = {}
-    for k, v in model.state_dict().items():
-        clean_key = k.replace('_orig_mod.', '')
-        clean_state_dict[clean_key] = v
+    clean_state_dict = sanitize_model_state_dict(model)
     
     final_checkpoint = {
         'model_state_dict': clean_state_dict,
@@ -712,6 +1004,9 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
         raise ImportError("Please install 'peft' for fine-tuning: pip install peft")
     
     print("Running in FINETUNE mode with LoRA...")
+    if dataloader_len <= 0:
+        print("ERROR: dataloader_len must be > 0. If automatic detection failed, please specify --dataset-size.")
+        return
 
     # Load the base model and its config
     model, model_config = load_full_model_with_config(args.model_path, device)
@@ -788,6 +1083,20 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
         modules_to_save=["ltm"],  # LTM still updated directly
     )
     model = get_peft_model(model, lora_config)
+
+    # Resumption Logic
+    start_epoch = 0
+    start_step = 0
+    checkpoint = None
+    if getattr(args, 'resume_from_ckpt', None):
+        print(f"Resuming LoRA finetune from: {args.resume_from_ckpt}")
+        checkpoint = torch.load(args.resume_from_ckpt, map_location='cpu')
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(sanitize_model_state_dict(checkpoint['model_state_dict'], reset_transient_ltm=False), strict=False)
+        start_epoch = checkpoint.get('completed_epoch', 0)
+        start_step = checkpoint.get('mid_epoch_step', 0)
+        print(f"INFO: Resuming from epoch {start_epoch+1}, step {start_step}.")
+
     model.print_trainable_parameters()
 
     # Optimizer selection
@@ -797,14 +1106,27 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     else:
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr)
     
+    if checkpoint and 'optimizer_state_dict' in checkpoint:
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print("Successfully loaded optimizer state.")
+        except:
+            print("Warning: Could not load optimizer state.")
+
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # AMP setup
+    # AMP setup (BFloat16 does NOT use GradScaler — only float16 needs it)
     scaler = None
     use_amp = getattr(args, 'amp', False)
+    amp_dtype_str = getattr(args, 'amp_dtype', None) or getattr(model.config if hasattr(model, 'config') else args, 'amp_dtype', 'float16')
+    amp_dtype = torch.bfloat16 if amp_dtype_str == 'bfloat16' else torch.float16
     if use_amp:
-        scaler = GradScaler()
-        print("INFO: Automatic Mixed Precision (AMP) ENABLED for fine-tuning.")
+        if amp_dtype_str == 'float16':
+            scaler = GradScaler()
+            if checkpoint and 'scaler_state_dict' in checkpoint:
+                try: scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                except: pass
+        print(f"INFO: Automatic Mixed Precision (AMP) ENABLED for fine-tuning ({amp_dtype_str}).")
 
     # Scheduler setup
     scheduler = None
@@ -814,6 +1136,9 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
         if num_update_steps > 0:
             print(f"INFO: Cosine Annealing LR scheduler ENABLED. Total steps: {num_update_steps}, Max LR: {args.starting_lr}, Min LR: {args.min_lr}")
             scheduler = CosineAnnealingLR(optimizer, T_max=num_update_steps, eta_min=args.min_lr)
+            if checkpoint and 'scheduler_state_dict' in checkpoint:
+                try: scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                except: pass
         else:
             print("Warning: Cannot enable LR schedule, dataset might be too small.")
 
@@ -825,9 +1150,10 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     grad_clip = getattr(args, 'grad_clip', 1.0)
     ltm_lr = getattr(args, 'ltm_lr', 0.001)
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         print(f"\n--- LoRA Finetune Epoch {epoch + 1} / {args.epochs} ---")
-        pbar = tqdm(dataloader, desc=f"Finetune Epoch {epoch + 1}")
+        set_dataloader_epoch(dataloader, epoch)
+        pbar = tqdm(dataloader, desc=f"Finetune Epoch {epoch + 1}", total=dataloader_len)
         total_loss = 0.0
         total_ponder_cost = 0.0
         total_commitment_cost = 0.0
@@ -836,18 +1162,36 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
         steps_in_epoch = 0
 
         for i, batch in enumerate(pbar):
+            # Mid-Epoch Resumption: Skip steps already processed
+            if epoch == start_epoch and i < start_step:
+                if i == start_step - 1:
+                    print(f"INFO: Resuming from mid-epoch step {start_step}...")
+                continue
+
             if batch is None:
                 continue
 
-            input_ids = batch["input_ids"].to(device)
+            input_ids = batch["input_ids"]
             attention_mask = batch.get("attention_mask")
+            labels = batch["labels"]
+            input_ids, labels, attention_mask = trim_trailing_padding(
+                input_ids, labels, attention_mask
+            )
+            non_blocking = device.type == 'cuda'
+            input_ids = input_ids.to(device, non_blocking=non_blocking)
             if attention_mask is not None:
-                attention_mask = attention_mask.to(device)
-            labels = batch["labels"].to(device)
+                attention_mask = attention_mask.to(device, non_blocking=non_blocking)
+            labels = labels.to(device, non_blocking=non_blocking)
 
             autocast_device_type = 'cpu' if is_directml_device(device) else device.type
-            with autocast(device_type=autocast_device_type, enabled=use_amp):
+            with autocast(device_type=autocast_device_type, dtype=amp_dtype, enabled=use_amp):
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                
+                # AMP FIX: Cast topk_vals to float32 before retain_grad (same fix as train path).
+                # Prevents masked_scatter_ dtype mismatch crash under BFloat16 AMP.
+                if outputs.get("topk_vals") is not None and outputs["topk_vals"].requires_grad:
+                    outputs["topk_vals"] = outputs["topk_vals"].float()
+                    outputs["topk_vals"].retain_grad()
                 
                 cross_entropy_loss = outputs.get("loss")
                 ponder_cost = outputs.get("ponder_cost")
@@ -919,6 +1263,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                                 outputs["topk_idx"],
                                 ltm_grads_copy,
                                 current_lr=ltm_lr,
+                                timestamp=float(i + 1),
                                 source=2  # SRC_TRAINING_DATA
                             )
 
@@ -940,6 +1285,20 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                     optimizer.zero_grad(set_to_none=True)
                     backward_called_in_cycle = False
                     global_step += 1
+
+                    # Periodic Checkpointing (Progress Protection)
+                    if getattr(args, 'save_steps', 0) > 0 and (i + 1) % args.save_steps == 0:
+                        ckpt_path = os.path.join(args.out_dir, f"hierarchos_finetune_epoch_{epoch+1}_step_{i+1}.pt")
+                        print(f"\n[Step {i+1}] Periodic Checkpoint: Saving to {ckpt_path}...")
+                        save_checkpoint_safely({
+                            'completed_epoch': epoch,
+                            'mid_epoch_step': i + 1,
+                            'model_state_dict': sanitize_model_state_dict(model),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                            'scaler_state_dict': scaler.state_dict() if scaler else None,
+                            'config': dict(model.config),
+                        }, ckpt_path)
                 else:
                     print(f"\nWarning: Skipping optimizer step at batch {i+1} due to invalid loss.")
                     optimizer.zero_grad(set_to_none=True)
